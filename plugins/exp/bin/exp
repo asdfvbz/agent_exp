@@ -1,0 +1,31 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""exp 的可执行入口。
+
+**为什么需要这个文件:** 文档里所有命令都写成 `exp query "..."`,
+但 exp.py 本身只是一个模块 —— 没有入口的话,用户照抄 README
+会得到 `command not found`。对开源项目来说,这个错误在第一分钟
+就劝退了所有人。
+
+用法(任选其一):
+
+  1. 加进 PATH
+       export PATH="$PATH:<插件目录>/bin"
+
+  2. 软链到已有 PATH
+       ln -s <插件目录>/bin/exp /usr/local/bin/exp
+
+  3. 别名
+       alias exp='python3 <插件目录>/exp.py'
+
+Windows 上用 exp.cmd 或 exp.ps1(同目录)。
+"""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from exp import main  # noqa: E402
+
+if __name__ == "__main__":
+    sys.exit(main())

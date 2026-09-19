@@ -1,0 +1,10 @@
+# 这个仓库自己的 gitignore(.exp/ 下的那份由 `exp init` 生成)
+
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 本地测试时可能留下的经验库
+.exp/

@@ -1,0 +1,18 @@
+{
+  "name": "exp",
+  "owner": {
+    "name": "asdfvbz"
+  },
+  "metadata": {
+    "description": "两层经验库:让 agent 记住踩过的坑,并验证它是否真的记住了",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "exp",
+      "source": "./plugins/exp",
+      "description": "两层经验库(全局 + 项目级)。capture 机器强制,hook 自动注入,复发检测自动淘汰坏经验。",
+      "version": "0.1.0"
+    }
+  ]
+}

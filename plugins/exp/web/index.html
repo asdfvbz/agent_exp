@@ -1,0 +1,632 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>exp · 经验库</title>
+<style>
+/* ── 令牌 ──────────────────────────────────────────
+   两个模式都是【选定】的,不是自动反转。
+   状态色 fixed —— 两个模式共用同一组,它们本就是为
+   "带图标+文字"的用法设计的,从不单独承载语义。           */
+:root {
+  --surface-1: #fcfcfb;
+  --plane:     #f9f9f7;
+  --ink:       #0b0b0b;
+  --ink-2:     #52514e;
+  --muted:     #898781;
+  --grid:      #e1e0d9;
+  --baseline:  #c3c2b7;
+  --border:    rgba(11,11,11,0.10);
+  --wash:      rgba(11,11,11,0.03);
+
+  /* 状态色 —— 固定,不随主题变 */
+  --good:     #0ca30c;
+  --warning:  #fab219;
+  --serious:  #ec835a;
+  --critical: #d03b3b;
+
+  --r: 8px;
+  --sans: system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+  --mono: ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --surface-1: #1a1a19;
+    --plane:     #0d0d0d;
+    --ink:       #ffffff;
+    --ink-2:     #c3c2b7;
+    --muted:     #898781;
+    --grid:      #2c2c2a;
+    --baseline:  #383835;
+    --border:    rgba(255,255,255,0.10);
+    --wash:      rgba(255,255,255,0.04);
+  }
+}
+
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body {
+  margin: 0; background: var(--plane); color: var(--ink);
+  font: 14px/1.55 var(--sans);
+  -webkit-font-smoothing: antialiased;
+}
+code, .mono { font-family: var(--mono); font-size: 0.92em; }
+a { color: inherit; }
+
+/* ── 页头 ── */
+header {
+  padding: 20px 24px 0; max-width: 1400px; margin: 0 auto;
+}
+h1 { margin: 0; font-size: 19px; font-weight: 650; letter-spacing: -0.01em; }
+h1 .sub { font-weight: 400; color: var(--muted); font-size: 13px; margin-left: 10px; }
+.roots {
+  margin-top: 6px; font: 12px/1.6 var(--mono); color: var(--muted);
+  display: flex; flex-wrap: wrap; gap: 4px 18px;
+}
+.roots b { color: var(--ink-2); font-weight: 500; }
+
+/* ── KPI 行 ── */
+.kpis {
+  display: grid; gap: 10px; margin: 18px 0 0;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+}
+.tile {
+  background: var(--surface-1); border: 1px solid var(--border);
+  border-radius: var(--r); padding: 12px 14px;
+  cursor: pointer; text-align: left; font: inherit; color: inherit;
+  transition: border-color .12s, background .12s;
+}
+.tile:hover { border-color: var(--baseline); }
+.tile[aria-pressed="true"] { border-color: var(--ink-2); background: var(--wash); }
+.tile .label {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 12px; color: var(--ink-2); margin-bottom: 6px;
+}
+.tile .value { font-size: 26px; font-weight: 600; letter-spacing: -0.02em; }
+
+/* 状态点 —— 形状 + 颜色双通道,从不只靠颜色 */
+.dot {
+  width: 9px; height: 9px; flex: 0 0 9px; border-radius: 50%;
+  background: currentColor; display: inline-block;
+}
+.g-good     { color: var(--good); }
+.g-warning  { color: var(--warning); }
+.g-serious  { color: var(--serious); }
+.g-critical { color: var(--critical); }
+.g-muted    { color: var(--muted); }
+
+/* 形状区分:不同健康度用不同字形,色盲/灰度下仍可辨 */
+.dot.glyph { border-radius: 0; background: none; font-size: 11px; line-height: 1;
+             width: auto; height: auto; flex: none; }
+
+/* ── 工具条 ── */
+.toolbar {
+  display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+  margin: 18px 0 12px;
+}
+input[type=search], select {
+  background: var(--surface-1); color: var(--ink);
+  border: 1px solid var(--border); border-radius: 6px;
+  padding: 6px 9px; font: 13px var(--sans);
+}
+input[type=search] { min-width: 240px; }
+input[type=search]:focus, select:focus { outline: 2px solid var(--ink-2); outline-offset: -1px; }
+.spacer { flex: 1 1 auto; }
+button.ghost {
+  background: var(--surface-1); color: var(--ink-2);
+  border: 1px solid var(--border); border-radius: 6px;
+  padding: 6px 11px; font: 13px var(--sans); cursor: pointer;
+}
+button.ghost:hover { border-color: var(--baseline); color: var(--ink); }
+button.ghost[aria-pressed="true"] { border-color: var(--ink-2); color: var(--ink); background: var(--wash); }
+
+/* ── 列表 ── */
+main { max-width: 1400px; margin: 0 auto; padding: 0 24px 60px; }
+.cards { display: grid; gap: 10px; }
+.card {
+  background: var(--surface-1); border: 1px solid var(--border);
+  border-radius: var(--r); padding: 13px 15px;
+  cursor: pointer; transition: border-color .12s;
+}
+.card:hover { border-color: var(--baseline); }
+.card .top { display: flex; align-items: baseline; gap: 9px; flex-wrap: wrap; }
+.card .title { font-weight: 570; font-size: 14.5px; }
+.card .trigger {
+  margin-top: 5px; color: var(--ink-2); font-size: 12.5px;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.meta { margin-top: 8px; display: flex; gap: 14px; flex-wrap: wrap; font-size: 11.5px; color: var(--muted); }
+.meta b { font-weight: 600; color: var(--ink-2); font-variant-numeric: tabular-nums; }
+
+/* 徽章:色点承载身份,文字用墨色令牌 —— 文字不穿系列色 */
+.badge {
+  display: inline-flex; align-items: center; gap: 5px;
+  font-size: 11.5px; color: var(--ink-2);
+  border: 1px solid var(--border); border-radius: 20px;
+  padding: 1px 9px 1px 7px; white-space: nowrap;
+}
+.badge.tint-good     { background: color-mix(in srgb, var(--good) 12%, transparent); }
+.badge.tint-warning  { background: color-mix(in srgb, var(--warning) 16%, transparent); }
+.badge.tint-serious  { background: color-mix(in srgb, var(--serious) 15%, transparent); }
+.badge.tint-critical { background: color-mix(in srgb, var(--critical) 13%, transparent); }
+
+/* ── 表格视图(无障碍备用通道)── */
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--grid); }
+th { color: var(--muted); font-weight: 500; font-size: 12px; }
+td.num { font-variant-numeric: tabular-nums; }
+tbody tr { cursor: pointer; }
+tbody tr:hover { background: var(--wash); }
+
+/* ── 详情抽屉 ── */
+.scrim {
+  position: fixed; inset: 0; background: rgba(0,0,0,.42);
+  opacity: 0; pointer-events: none; transition: opacity .16s; z-index: 40;
+}
+.scrim.open { opacity: 1; pointer-events: auto; }
+.drawer {
+  position: fixed; top: 0; right: 0; bottom: 0; width: min(620px, 94vw);
+  background: var(--surface-1); border-left: 1px solid var(--border);
+  transform: translateX(100%); transition: transform .18s cubic-bezier(.4,0,.2,1);
+  z-index: 50; display: flex; flex-direction: column;
+}
+.drawer.open { transform: none; }
+.drawer .head {
+  padding: 18px 20px 14px; border-bottom: 1px solid var(--grid);
+  display: flex; gap: 12px; align-items: flex-start;
+}
+.drawer .head h2 { margin: 0; font-size: 16px; font-weight: 620; flex: 1; }
+.drawer .body { overflow-y: auto; padding: 4px 20px 40px; }
+.drawer h3 {
+  font-size: 12px; text-transform: none; color: var(--muted);
+  margin: 20px 0 6px; font-weight: 500; letter-spacing: .02em;
+}
+.drawer p { margin: 0 0 10px; white-space: pre-wrap; color: var(--ink-2); }
+.drawer .counters {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(88px,1fr));
+  gap: 8px; margin: 16px 0 4px;
+}
+.counter {
+  border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px;
+}
+.counter .k { font-size: 11px; color: var(--muted); }
+.counter .v { font-size: 18px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.close {
+  background: none; border: 1px solid var(--border); color: var(--ink-2);
+  border-radius: 6px; width: 30px; height: 30px; cursor: pointer; font-size: 15px;
+  line-height: 1; flex: none;
+}
+.close:hover { border-color: var(--baseline); color: var(--ink); }
+
+/* 一条经验在列表中显示的"注入 vs 复发"细条 —— 细标记,不是仪表盘 */
+.bar { height: 3px; border-radius: 2px; background: var(--grid); margin-top: 9px; overflow: hidden; display: flex; }
+.bar i { display: block; height: 100%; }
+.bar .ok { background: var(--good); }
+.bar .bad { background: var(--critical); }
+
+/* 分组标题 —— 和 exp list 的分组一致 */
+.sechead {
+  display: flex; align-items: center; gap: 8px;
+  margin: 22px 0 9px; font-size: 12.5px; color: var(--ink-2);
+  border-bottom: 1px solid var(--grid); padding-bottom: 6px;
+}
+.sechead:first-child { margin-top: 4px; }
+.sechead .count {
+  font-size: 11px; color: var(--muted);
+  border: 1px solid var(--border); border-radius: 20px; padding: 0 7px;
+  font-variant-numeric: tabular-nums;
+}
+.sechead .note { font-size: 11px; color: var(--muted); margin-left: auto; }
+
+/* 索引容量告警 —— 最隐蔽的失效模式,给它最显眼的位置 */
+.alert {
+  border: 1px solid var(--serious); border-radius: var(--r);
+  background: color-mix(in srgb, var(--serious) 12%, transparent);
+  padding: 12px 15px; margin: 0 0 16px; font-size: 13.5px;
+}
+.alert b { color: var(--ink); }
+.alert .hint { margin-top: 6px; font-size: 12.5px; color: var(--ink-2); }
+
+.empty { color: var(--muted); padding: 40px 0; text-align: center; }
+.path { font: 11.5px var(--mono); color: var(--muted); word-break: break-all; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>经验库 <span class="sub" id="total-sub"></span></h1>
+  <div class="roots" id="roots"></div>
+</header>
+
+<main>
+  <div class="kpis" id="kpis"></div>
+
+  <div class="toolbar">
+    <input type="search" id="q" placeholder="搜索标题 / 触发词 / 根因 / 做法…" autocomplete="off">
+    <select id="f-layer"><option value="">全部层级</option><option value="project">项目级</option><option value="global">全局级</option></select>
+    <select id="f-health"><option value="">全部健康度</option><option value="ok">正常</option><option value="missed">检索漏检</option><option value="dead">死重</option><option value="rotten">反复复发</option></select>
+    <select id="f-cat"><option value="">全部分类</option></select>
+    <select id="f-status"><option value="">全部状态</option><option value="confirmed">已确认</option><option value="hypothesis">未验证</option><option value="refuted">已推翻</option><option value="needs_rewrite">待重写</option></select>
+    <span class="spacer"></span>
+    <span style="font-size:12px;color:var(--muted)">分组</span>
+    <button class="ghost" id="g-health" aria-pressed="true">健康度</button>
+    <button class="ghost" id="g-cluster" aria-pressed="false">相似度</button>
+    <button class="ghost" id="g-none" aria-pressed="false">不分组</button>
+    <span class="spacer"></span>
+    <button class="ghost" id="v-cards" aria-pressed="true">卡片</button>
+    <button class="ghost" id="v-table" aria-pressed="false">表格</button>
+    <button class="ghost" id="reload">刷新</button>
+  </div>
+
+  <div id="view"></div>
+</main>
+
+<div class="scrim" id="scrim"></div>
+<aside class="drawer" id="drawer" role="dialog" aria-modal="true" aria-labelledby="d-title">
+  <div class="head">
+    <h2 id="d-title"></h2>
+    <button class="close" id="d-close" aria-label="关闭">✕</button>
+  </div>
+  <div class="body" id="d-body"></div>
+</aside>
+
+<script>
+let DATA = { stats:{}, lessons:[], roots:{}, clusters:[], neighbors:{}, index:{} };
+/* 分组方式:health(默认,算出来的,不腐烂)/ cluster(现算的相似度分组)
+   category 已降级为"仅人工翻阅"的标签,不再是主视图。 */
+let groupBy = "health";
+let view = "cards";
+let kpiFilter = "";
+
+/* 健康度只提供【表现形式】(字形 + 颜色),文案由 API 给。
+   文案在 Python 里单点定义,CLI 和网页共用 —— 两边各写一份必然漂移,
+   而对"哪些经验是坏的"给出不同答案是致命的。 */
+const HEALTH_TONE = {
+  ok:      { glyph:"●", tone:"g-good" },
+  missed:  { glyph:"▲", tone:"g-warning" },
+  dead:    { glyph:"◆", tone:"g-serious" },
+  rotten:  { glyph:"■", tone:"g-critical" },
+};
+const HEALTH_ORDER = ["rotten", "missed", "dead", "ok"];
+/* 分组视图的标题 —— 和 exp list 的分组一致 */
+const HEALTH_HEAD = {
+  rotten: "反复复发 —— 注入了还是犯,fix 不可执行",
+  missed: "检索漏检 —— 触发词写偏了,该命中没命中",
+  dead:   "死重 —— 记了 30 天从没被命中过",
+  ok:     "正常",
+};
+const STATUS = {
+  confirmed:     { label:"已确认", tone:"g-good" },
+  hypothesis:    { label:"未验证", tone:"g-muted" },
+  refuted:       { label:"已推翻", tone:"g-muted" },
+  needs_rewrite: { label:"待重写", tone:"g-critical" },
+};
+const SEV = { high:"高", medium:"中", low:"低", "":"" };
+
+const esc = s => String(s ?? "").replace(/[&<>"']/g,
+  c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
+
+function badge(tone, glyph, label, tint) {
+  const g = glyph ? `<span class="dot glyph ${tone}">${glyph}</span>` : `<span class="dot ${tone}"></span>`;
+  return `<span class="badge${tint ? " tint-" + tint : ""}">${g}${esc(label)}</span>`;
+}
+
+/* ── KPI ── */
+function renderKpis() {
+  const s = DATA.stats;
+  const tiles = [
+    { k:"总数",     v:s.total,      f:"",          tone:"g-muted",    glyph:"●" },
+    { k:"已确认",   v:s.confirmed,  f:"status=confirmed",                 tone:"g-good",     glyph:"●" },
+    { k:"反复复发", v:s.rotten,     f:"health=rotten",                    tone:"g-critical", glyph:"■" },
+    { k:"死重",     v:s.dead,       f:"health=dead",                      tone:"g-serious",  glyph:"◆" },
+    { k:"检索漏检", v:s.missed,     f:"health=missed",                    tone:"g-warning",  glyph:"▲" },
+  ];
+  document.getElementById("kpis").innerHTML = tiles.map(t => `
+    <button class="tile" data-f="${t.f}" aria-pressed="${kpiFilter === t.f && t.f ? "true" : "false"}">
+      <span class="label">${badge(t.tone, t.glyph, t.k)}</span>
+      <span class="value">${t.v ?? 0}</span>
+    </button>`).join("");
+
+  document.querySelectorAll(".tile").forEach(el => el.onclick = () => {
+    const f = el.dataset.f;
+    kpiFilter = (kpiFilter === f) ? "" : f;
+    document.getElementById("f-health").value = "";
+    document.getElementById("f-status").value = "";
+    render();
+  });
+
+  const st = DATA.stats;
+  document.getElementById("total-sub").textContent =
+    `项目 ${st.project} · 全局 ${st.global} · 累计注入 ${st.injections} 次 · 检出复发 ${st.recurred} 次`;
+  const r = DATA.roots || {};
+  document.getElementById("roots").innerHTML =
+    `<span><b>项目级</b> ${esc(r.project || "(无)")}</span>` +
+    `<span><b>全局级</b> ${esc(r.global || "")}</span>`;
+}
+
+/* ── 筛选 ── */
+function filtered() {
+  const q = document.getElementById("q").value.trim().toLowerCase();
+  const layer = document.getElementById("f-layer").value;
+  let health = document.getElementById("f-health").value;
+  const cat = document.getElementById("f-cat").value;
+  let status = document.getElementById("f-status").value;
+
+  // KPI 磁贴是快捷筛选:点一下等于设置对应筛选
+  if (kpiFilter) {
+    const [k, v] = kpiFilter.split("=");
+    if (k === "health") health = v; else status = v;
+  }
+  return DATA.lessons.filter(l => {
+    if (layer && l.layer !== layer) return false;
+    if (health && l.health !== health) return false;
+    if (cat && l.category !== cat) return false;
+    if (status && l.status !== status) return false;
+    if (q) {
+      const hay = [l.title, l.trigger, l.root_cause, l.fix, l.symptom, l.id]
+        .join(" ").toLowerCase();
+      if (!hay.includes(q)) return false;
+    }
+    return true;
+  });
+}
+
+const HEALTH_TINT = { rotten:"critical", missed:"warning", dead:"serious", ok:"" };
+function healthBadge(l) {
+  const h = typeof l === "string" ? l : l.health;
+  const k = HEALTH_TONE[h] || HEALTH_TONE.ok;
+  const label = typeof l === "string" ? h : (l.health_label || h);
+  return badge(k.tone, k.glyph, label, HEALTH_TINT[h] || "");
+}
+function statusBadge(s) {
+  const k = STATUS[s] || STATUS.hypothesis;
+  return badge(k.tone, "", k.label);
+}
+
+/* 注入 vs 复发:一条细条,不是仪表盘。
+   分母是"注入次数",复发段画在右侧。 */
+function bar(l) {
+  const tot = (l.injected || 0) + (l.recurred || 0);
+  if (!tot) return "";
+  const bad = Math.round((l.recurred || 0) / tot * 100);
+  return `<div class="bar" title="注入 ${l.injected} · 复发 ${l.recurred}">
+    <i class="ok" style="width:${100 - bad}%"></i><i class="bad" style="width:${bad}%"></i>
+  </div>`;
+}
+
+/* ── 渲染 ── */
+/* 索引容量告警 —— 最隐蔽的失效模式,必须显眼。
+   索引满了 → 有经验永远不会被注入 → 它们的 missed 永远算不出来
+   → 界面显示"一切正常",而实际有一批经验从没机会出现。 */
+function capacityBanner() {
+  const ix = DATA.index || {};
+  if (!ix.dropped) return "";
+  return `<div class="alert">
+    <b>索引已满</b> —— 容量 ${ix.capacity} 条,现有 ${ix.total} 条,
+    <b>${ix.dropped} 条不会被注入</b>。
+    <div class="hint">被漏掉的经验永远不会被注入,所以它们的「检索漏检」
+      永远算不出来 —— 这不是正常状态。用「相似度」分组找该合并的,
+      或去清理死重。</div>
+  </div>`;
+}
+
+function render() {
+  const items = filtered();
+  const el = document.getElementById("view");
+  if (!items.length) {
+    el.innerHTML = capacityBanner() + `<div class="empty">没有匹配的经验。</div>`;
+    return;
+  }
+  let body;
+  if (view === "table" || groupBy === "none") {
+    body = view === "table" ? tbl(items) : cards(items);
+  } else {
+    // 表格视图忽略分组 —— 它本来就是"平铺 + 可排序"的另一个视角
+    body = groupBy === "cluster" ? groupedByCluster(items) : groupedByHealth(items);
+  }
+  el.innerHTML = capacityBanner() + body;
+  el.querySelectorAll("[data-id]").forEach(n =>
+    n.onclick = (e) => { e.stopPropagation(); openDrawer(n.dataset.id); });
+}
+
+function cardHtml(l) {
+  return `
+    <article class="card" data-id="${esc(l.id)}">
+      <div class="top">
+        <span class="title">${esc(l.title)}</span>
+        ${healthBadge(l)}
+        ${statusBadge(l.status)}
+        <span class="badge">${l.layer === "global" ? "全局" : "项目"}</span>
+        ${l.severity ? `<span class="badge">${SEV[l.severity] || l.severity}</span>` : ""}
+      </div>
+      ${l.trigger ? `<div class="trigger">${esc(l.trigger)}</div>` : ""}
+      <div class="meta">
+        <span>注入 <b>${l.injected}</b></span>
+        <span>复发 <b>${l.recurred}</b></span>
+        <span>漏检 <b>${l.missed}</b></span>
+        <span>有用 <b>${l.helped}</b></span>
+        <span>${esc(l.category)}</span>
+      </div>
+      ${bar(l)}
+    </article>`;
+}
+
+function cards(items) {
+  return `<div class="cards">` + items.map(cardHtml).join("") + `</div>`;
+}
+
+/* 按健康度分组 —— 这是主视图。
+   健康度是算出来的,不会腐烂;而且它才是你要【动手处理】的东西。 */
+function groupedByHealth(items) {
+  let out = "";
+  for (const h of HEALTH_ORDER) {
+    const g = items.filter(l => l.health === h);
+    if (!g.length) continue;
+    out += `<div class="sechead">${esc(HEALTH_HEAD[h] || h)}
+      <span class="count">${g.length}</span></div>`;
+    out += `<div class="cards">` + g.map(cardHtml).join("") + `</div>`;
+  }
+  return out;
+}
+
+/* 按相似度分组 —— 现算的聚类,回答的是【整理】问题:
+   「有哪些其实是同一个原则?哪两条该合并?」
+   注意它是不稳定的:加一条经验分组就会移位。所以它只用于看,不落盘。 */
+function groupedByCluster(items) {
+  const byId = Object.fromEntries(items.map(l => [l.id, l]));
+  const groups = (DATA.clusters || [])
+    .map(g => g.ids.map(id => byId[id]).filter(Boolean))
+    .filter(g => g.length >= 2);
+  const grouped = new Set(groups.flat().map(l => l.id));
+  let out = "";
+  if (!groups.length) {
+    out += `<div class="empty" style="padding:24px 0">
+      没有形成任何相似度分组 —— 说明经验之间彼此独立,没有冗余。</div>`;
+  }
+  groups.forEach((g, i) => {
+    out += `<div class="sechead">相似组 ${i + 1}
+      <span class="count">${g.length}</span>
+      <span class="note">可能该合并</span></div>`;
+    out += `<div class="cards">` + g.map(cardHtml).join("") + `</div>`;
+  });
+  const rest = items.filter(l => !grouped.has(l.id));
+  if (rest.length) {
+    out += `<div class="sechead">未成组<span class="count">${rest.length}</span></div>`;
+    out += `<div class="cards">` + rest.map(cardHtml).join("") + `</div>`;
+  }
+  return out;
+}
+
+function tbl(items) {
+  return `<table>
+    <thead><tr>
+      <th>标题</th><th>健康度</th><th>状态</th><th>层级</th>
+      <th>触发词</th><th>注入</th><th>复发</th><th>漏检</th>
+    </tr></thead><tbody>` + items.map(l => `
+    <tr data-id="${esc(l.id)}">
+      <td>${esc(l.title)}</td>
+      <td>${healthBadge(l)}</td>
+      <td>${statusBadge(l.status)}</td>
+      <td>${l.layer === "global" ? "全局" : "项目"}</td>
+      <td>${esc((l.trigger || "").split("\n")[0].slice(0, 46))}</td>
+      <td class="num">${l.injected}</td>
+      <td class="num">${l.recurred}</td>
+      <td class="num">${l.missed}</td>
+    </tr>`).join("") + `</tbody></table>`;
+}
+
+/* ── 抽屉 ── */
+function openDrawer(id) {
+  const l = DATA.lessons.find(x => x.id === id);
+  if (!l) return;
+  document.getElementById("d-title").textContent = l.title;
+
+  const sec = (h, v) => v ? `<h3>${h}</h3><p>${esc(v)}</p>` : "";
+  const counts = [
+    ["注入", l.injected], ["复发", l.recurred],
+    ["漏检", l.missed],   ["有用", l.helped],
+  ].map(([k, v]) => `<div class="counter"><div class="k">${k}</div><div class="v">${v}</div></div>`).join("");
+
+  // 诊断文案来自 API —— CLI 和网页共用一处定义
+  const diag = l.health_action || "";
+
+  // 相关是【算出来】的,不是存的。见 Library.neighbors。
+  const nbs = (DATA.neighbors[l.id] || [])
+    .map(([sim, id]) => {
+      const o = DATA.lessons.find(x => x.id === id);
+      return o ? { sim, o } : null;
+    }).filter(Boolean);
+  const nbHtml = nbs.length ? `<h3>相关(按触发词相似度算的)</h3>` +
+    nbs.map(({ sim, o }) =>
+      `<p style="margin:0 0 4px"><span class="mono" style="color:var(--muted)">${
+        Math.round(sim * 100)}%</span>
+       <a href="#" data-jump="${esc(o.id)}" style="color:inherit">${esc(o.title)}</a></p>`
+    ).join("") : "";
+
+  document.getElementById("d-body").innerHTML = `
+    <div style="display:flex;gap:7px;flex-wrap:wrap;margin-top:14px">
+      ${healthBadge(l)} ${statusBadge(l.status)}
+      <span class="badge">${l.layer === "global" ? "全局级" : "项目级"}</span>
+      <span class="badge">${esc(l.category)}</span>
+      ${l.severity ? `<span class="badge">严重度 ${SEV[l.severity] || l.severity}</span>` : ""}
+      ${l.created ? `<span class="badge">${esc(l.created)}</span>` : ""}
+    </div>
+    ${diag ? `<p style="margin-top:12px;color:var(--ink)">${esc(diag)}</p>` : ""}
+    <div class="counters">${counts}</div>
+    ${sec("何时适用(触发词)", l.trigger)}
+    ${sec("表现", l.symptom)}
+    ${sec("根因", l.root_cause)}
+    ${sec("做法", l.fix)}
+    ${sec("证据", l.evidence)}
+    ${sec("适用范围", l.scope)}
+    ${nbHtml}
+    ${l.last_recurred ? `<h3>最近复发</h3><p class="path">${esc(l.last_recurred)}</p>` : ""}
+    <h3>文件</h3><p class="path">${esc(l.layer === "global"
+        ? (DATA.roots.global || "") + "/lessons/" + l.id + ".md"
+        : (DATA.roots.project || "") + "/lessons/" + l.id + ".md")}</p>
+    <h3>命令行</h3><p class="path">exp show ${esc(l.id)}</p>
+  `;
+  // 相关条目可点击跳转
+  document.querySelectorAll("[data-jump]").forEach(n => n.onclick = (e) => {
+    e.preventDefault();
+    openDrawer(n.dataset.jump);
+  });
+  document.getElementById("drawer").classList.add("open");
+  document.getElementById("scrim").classList.add("open");
+}
+function closeDrawer() {
+  document.getElementById("drawer").classList.remove("open");
+  document.getElementById("scrim").classList.remove("open");
+}
+document.getElementById("d-close").onclick = closeDrawer;
+document.getElementById("scrim").onclick = closeDrawer;
+document.addEventListener("keydown", e => { if (e.key === "Escape") closeDrawer(); });
+
+/* ── 视图切换 / 事件 ── */
+function setView(v) {
+  view = v;
+  document.getElementById("v-cards").setAttribute("aria-pressed", v === "cards");
+  document.getElementById("v-table").setAttribute("aria-pressed", v === "table");
+  render();
+}
+document.getElementById("v-cards").onclick = () => setView("cards");
+document.getElementById("v-table").onclick = () => setView("table");
+
+/* 分组切换 —— health 是默认(算出来的,不腐烂);cluster 是现算的相似度;
+   none 回平铺。category 不在分组选项里,它降级成了卡片上的一个标签。 */
+function setGroup(g) {
+  groupBy = g;
+  ["health", "cluster", "none"].forEach(k =>
+    document.getElementById("g-" + k).setAttribute("aria-pressed", k === g));
+  if (g !== "none" && view === "table") setView("cards");  // 表格视图不支持分组
+  else render();
+}
+["health", "cluster", "none"].forEach(k =>
+  document.getElementById("g-" + k).onclick = () => setGroup(k));
+
+["q", "f-layer", "f-health", "f-cat", "f-status"].forEach(id =>
+  document.getElementById(id).addEventListener("input", () => { kpiFilter = ""; render(); }));
+
+async function load() {
+  try {
+    const r = await fetch("/api/data", { cache: "no-store" });
+    DATA = await r.json();
+  } catch (e) {
+    document.getElementById("view").innerHTML =
+      `<div class="empty">读不到数据。确认 exp serve 还在跑。</div>`;
+    return;
+  }
+  const cats = [...new Set(DATA.lessons.map(l => l.category))].sort();
+  document.getElementById("f-cat").innerHTML =
+    `<option value="">全部分类</option>` +
+    cats.map(c => `<option value="${esc(c)}">${esc(c)}</option>`).join("");
+  renderKpis();
+  render();
+}
+document.getElementById("reload").onclick = load;
+load();
+</script>
+</body>
+</html>

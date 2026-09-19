@@ -1,0 +1,9 @@
+{
+  "name": "exp",
+  "version": "0.1.0",
+  "description": "两层经验库(全局 + 项目级)。失败时机器强制捕获,开工前自动注入索引,复发时自动降级坏经验。",
+  "author": {
+    "name": "asdfvbz"
+  },
+  "hooks": "./hooks/hooks.json"
+}
