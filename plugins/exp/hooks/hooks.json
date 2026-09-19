@@ -1,4 +1,14 @@
 {
+  "_comment": [
+    "命令串为什么要包一层 `bash -c`:在 Windows 上 Claude Code 用 PowerShell",
+    "执行 hook 命令,而 PowerShell 既不认 `||`(旧版直接 ParserError/",
+    "InvalidEndOfLine),也不认 `${VAR}`(会被改写成 `${env:VAR}` 后报错)。",
+    "两个错误叠在一起,表现是三个 hook 全部静默不执行 —— 而 hook 失败是",
+    "非阻塞的,只在 transcript 里留一条 attachment,用户什么都看不到。",
+    "包成 `bash -c '...'` 之后,变量展开和 `||` 都交给 bash 处理,三平台一致。",
+    "验证方式:`claude plugin list` 看 Status,或看 transcript 里有没有",
+    "hook_non_blocking_error。"
+  ],
   "hooks": {
     "SessionStart": [
       {
@@ -6,8 +16,19 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/exp.py\" hook session-start || python \"${CLAUDE_PLUGIN_ROOT}/exp.py\" hook session-start",
+            "command": "bash -c 'python3 \"$CLAUDE_PLUGIN_ROOT/exp.py\" hook session-start 2>/dev/null || python \"$CLAUDE_PLUGIN_ROOT/exp.py\" hook session-start 2>/dev/null || true'",
             "timeout": 15
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash -c 'python3 \"$CLAUDE_PLUGIN_ROOT/exp.py\" hook user-prompt 2>/dev/null || python \"$CLAUDE_PLUGIN_ROOT/exp.py\" hook user-prompt 2>/dev/null || true'",
+            "timeout": 10
           }
         ]
       }
@@ -17,7 +38,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/exp.py\" hook post-failure || python \"${CLAUDE_PLUGIN_ROOT}/exp.py\" hook post-failure",
+            "command": "bash -c 'python3 \"$CLAUDE_PLUGIN_ROOT/exp.py\" hook post-failure 2>/dev/null || python \"$CLAUDE_PLUGIN_ROOT/exp.py\" hook post-failure 2>/dev/null || true'",
             "timeout": 10
           }
         ]
@@ -28,7 +49,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/exp.py\" hook stop || python \"${CLAUDE_PLUGIN_ROOT}/exp.py\" hook stop",
+            "command": "bash -c 'python3 \"$CLAUDE_PLUGIN_ROOT/exp.py\" hook stop 2>/dev/null || python \"$CLAUDE_PLUGIN_ROOT/exp.py\" hook stop 2>/dev/null || true'",
             "timeout": 20
           }
         ]
