@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 jobs:
   test:
@@ -11,7 +12,19 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        # **刻意不跑 macOS。**
+        #
+        # 私有仓库的 CI 计费:ubuntu ×1、windows ×2、**macos ×10**。
+        # 一次全矩阵跑下来 27 计费分钟,免费额度 2000/月只够 73 次 ——
+        # 而 macOS 一个人占掉 96%。
+        #
+        # 但它覆盖的差异很小:python3 路径 + 文件权限,
+        # 这两样 Linux 已经覆盖了。真正有平台特有行为的只有:
+        #   ubuntu  → python3 路径、bin/exp 的可执行位、LF 换行
+        #   windows → GBK 控制台、只有 python 没有 python3、CRLF
+        # 两个平台就够了。要临时验证 macOS 用 workflow_dispatch 手动触发的
+        # 分支,或本地跑 `python3 -m unittest discover -s tests`。
+        os: [ubuntu-latest, windows-latest]
         python: ["3.8", "3.12"]
     steps:
       - uses: actions/checkout@v4
@@ -43,9 +56,10 @@ jobs:
           python "$GITHUB_WORKSPACE/plugins/exp/exp.py" list
           python "$GITHUB_WORKSPACE/plugins/exp/exp.py" gc
 
-      # 清单校验 —— 坏了用户就装不上
+      # 清单校验 —— 坏了用户就装不上。
+      # 只跑一次就够,不必每个矩阵格都跑。
       - name: 校验插件清单
-        if: matrix.os == 'ubuntu-latest'
+        if: matrix.os == 'ubuntu-latest' && matrix.python == '3.12'
         run: |
           python -c "
           import json, pathlib, sys
@@ -55,3 +69,12 @@ jobs:
               json.loads(pathlib.Path(p).read_text(encoding='utf-8'))
               print('OK', p)
           "
+
+      # 可执行位:Windows 上 git 默认不记录,clone 到 Linux 就没法执行。
+      # 这条只在 ubuntu 上有意义,但正是它最容易静默回归。
+      - name: bin/exp 可执行且能跑
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          test -x plugins/exp/bin/exp || { echo "bin/exp 丢了可执行位"; exit 1; }
+          plugins/exp/bin/exp --help > /dev/null
+          echo "OK"
