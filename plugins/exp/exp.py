@@ -71,16 +71,100 @@ SEVERITIES = ["high", "medium", "low"]
 
 # 自动降级 / 死重判定阈值
 RECUR_THRESHOLD = 2      # 注入后仍复发 N 次 → 标记 needs_rewrite
-DEAD_WEIGHT_DAYS = 30    # 创建 N 天、注入 0 次 → 死重
+STARVE_THRESHOLD = 2     # 骨架命中却送不到 N 次 → 索引饿死,多半是容量问题
+DEAD_WEIGHT_DAYS = 30    # 创建 N 天、正文一次没投递过 → 死重 / 索引饿死
 
 # 索引容量。超过它,平铺 list 就开始漏经验 ——
 # 而漏掉的经验永远不会被注入,missed 也永远算不出来。
-# 这是"该上聚类了"的可测量信号,而不是一种理念。
-INDEX_MAX_ITEMS = 40
+#
+# **真正约束成本的是字符预算,不是条数。** 实测每条经验约 49 字符
+# (标题 + trigger 两行),4000 字符能装约 78 条 —— 而
+# INDEX_MAX_ITEMS 曾是 40,把一半预算白白浪费了。
+# 现在条数只作为防爆上限(防止极端短的条目把条数撑爆),
+# 有效容量由字符预算决定。
+INDEX_MAX_ITEMS = 120
 INDEX_MAX_CHARS = 4000
 
 # 注入记账的会话窗口(分钟)。失败发生在这段时间内的注入才算"当时在上下文里"。
 INJECT_WINDOW_MIN = 90
+
+# ── 归因模式 ───────────────────────────────────────
+#
+# 归因要判两件事:这条经验**该不该**在这次失败里出现,以及它**有没有**出现。
+# 前者靠检索,后者靠 injections.jsonl 记账。
+#
+# 检索有两档,精度差很多,必须分开对待:
+#
+#   skeleton  经验挂了签名,失败签名精确命中(路径/数字/引号内容都已归一化)。
+#             这是**结构性**断言:系统确知"这是同一种失败"。所以它身上
+#             出的岔子只可能是投递问题 → 记 starved,绝不记 missed。
+#
+#   related   没挂签名,只能用失败信息做二元组检索。这是**启发式**,
+#             会假阳性 —— 所以它才需要 missed 这个信号来暴露 trigger 写偏。
+#
+# 一句话:**结构性信号不产生 missed,启发式信号才产生。**
+#
+# 踩过的坑:上一版两条路径都记 missed,于是任何挂了签名的经验,
+# 只要模型没主动读过正文,都会稳定进 missed 桶 —— 而 gc 会据此
+# 建议"重写 trigger"。那条 trigger 从头到尾没被查过,失败是靠签名
+# 对上的。误诊比不诊断更坏(见 DESIGN.md「归因写错比不写更坏」)。
+ATTRIBUTION_MODE = "related"
+
+# ── 重复失败提示 ───────────────────────────────────
+#
+# 同一个签名当天第几次出现时,如果库里没有对应经验,就告诉模型。
+#
+# **为什么是 2:** 第 1 次出现无从判断它会不会重复 —— 那时候说什么都是噪声。
+# 第 2 次是"重复"被**确证**的那一刻,也正是签名长出来的那一刻。
+# 卡在 3 就意味着第 3 次学费已经交掉了。
+#
+# 这条提示的触发判据是【纯结构性】的:同一签名出现 N 次。
+# 它不依赖 trigger 的措辞,不需要经验库里先有任何东西 ——
+# 冷启动期唯一能工作的信号。
+REPEAT_HINT_THRESHOLD = 2
+
+# ── 任务前投递(UserPromptSubmit)────────────────────
+#
+# 这是**唯一**能真正在动作之前把经验送进上下文的通道。
+#
+# **为什么不是 PreToolUse:** 它的 `additionalContext` 是【和工具结果
+# 同一次】送达的 —— 文档原话是 "added to Claude's context alongside
+# the tool result"。而且这不是实现偷懒,是协议决定的:Messages API
+# 要求 `tool_result` 必须紧跟 `tool_use`,**没有**"模型决定调用"和
+# "工具真的执行"之间的那个位置可插。所以 PreToolUse 能改参数
+# (updatedInput)、能拦(permissionDecision),但**不能提前告知**。
+#
+# UserPromptSubmit 在模型处理 prompt 之前触发,additionalContext 随
+# prompt 一起进上下文 —— 那才是"动手之前"。
+#
+# 代价是它只能看到【用户的自然语言】,看不到具体的 tool_input。
+# 这个交换是值得的:看得见的意图远不如到得及的时机重要。
+# **每条 prompt 只推一条。** 实测(8 条 seed 库,4 条真实风格的 prompt):
+# 一次命中 3 条的 prompt,那条真正相关的经验只排第 2 —— 推两条就是
+# 一条相关 + 一条不相关,而不相关的那条会一直留在会话历史里。
+# 推一条:错了只错一条,而且下一次 prompt 会推别的。
+PRE_ACTION_MAX_LESSONS = 1
+PRE_ACTION_MAX_CHARS = 1600     # 单条正文的预算
+# 重合度阈值。**这个数字是量出来的,不是拍的。**
+#
+# 用真实会写的 trigger 和真实风格的 prompt 测(6 正例 / 3 反例):
+#
+#     阈值 1:  命中 5/6   误报 1/3
+#     阈值 2:  命中 0/6   误报 0/3     ← 功能等于关闭
+#     阈值 3:  命中 0/6   误报 0/3
+#
+# **两类在 1 分处完全重叠**:A 类分布 {0,1,1,1,1,1},B 类 {0,0,1}。
+# 也就是说二元组分数几乎只区分"同不同话题",不区分"相关不相关"。
+#
+# 那为什么还是取 1:因为**真正在做区分的是排序,不是阈值**。
+# 明显无关的 prompt("解释一下这个函数""总结项目架构")拿到 0,被挡住;
+# 进来的都是话题相邻的,再由 rank 选出最像的那一条。
+# 取 2 会让整个功能永不触发 —— 那是死代码,比有点噪声更坏。
+#
+# 已知弱点:匹配不到同义表达(见 DESIGN.md「为什么不用向量库」)。
+# 反例样本只有 3 条,精度数字不可靠;`helped` / `recurred` 是它在
+# 真实使用中暴露自己的方式。
+PRE_ACTION_MIN_OVERLAP = 1
 
 
 # ── 控制台编码 ─────────────────────────────────────
@@ -264,9 +348,12 @@ class Lesson:
     signatures: List[str] = field(default_factory=list)
     created: str = ""
     # ── 机器维护 ──
-    injected: int = 0
-    recurred: int = 0                # 注入了还犯
-    missed: int = 0                  # 该注入没注入
+    injected: int = 0                # 【正文】投递过几次(模型看到了根因+做法)
+    indexed: int = 0                 # 【标题】进过几次索引(session-start)
+    excluded: int = 0                # 索引渲染过几次、而它没挤进去
+    recurred: int = 0                # 看过做法还犯 → fix 不可执行
+    missed: int = 0                  # 语义匹配该命中却没命中 → trigger 写偏
+    starved: int = 0                 # 骨架精确命中却从没投递 → 投递策略的问题
     helped: int = 0                  # 显式正反馈
     last_injected: str = ""
     last_recurred: str = ""
@@ -284,21 +371,51 @@ class Lesson:
         return self.recurred >= RECUR_THRESHOLD
 
     @property
-    def is_dead_weight(self) -> bool:
-        """死重:记了从没被检索到,而且已经放了很久。"""
-        if self.injected > 0 or not self.created:
+    def _aged(self) -> bool:
+        if not self.created:
             return False
         try:
-            age = (dt.date.today() - dt.date.fromisoformat(self.created)).days
+            return (dt.date.today()
+                    - dt.date.fromisoformat(self.created)).days >= DEAD_WEIGHT_DAYS
         except Exception:
             return False
-        return age >= DEAD_WEIGHT_DAYS
+
+    @property
+    def is_starved_index(self) -> bool:
+        """索引饿死:索引渲染过、而它**一次都没挤进去**,也从没被投递。
+
+        这不是经验本身有问题 —— 是索引装不下,它连露面的机会都没有。
+
+        **为什么必须和死重分开:** 两者的现象完全一样(注入 0 次),
+        但病因和处方相反。死重的处方是"删掉或重写 trigger";
+        索引饿死的处方是"扩容量 / 上分层"。当成死重处理,会让用户
+        去删一条本来很有用、只是没排上队的经验。
+
+        **判据是 `excluded`(被挤掉的次数),不是年龄。**
+        上一版这里挂了 `_aged`(30 天),是错的 ——
+        死重确实需要时间(这条经验可能只是还没被用上),
+        但**容量溢出是算术事实**:50 条经验、上限 40 条,
+        今天就结构性地排除了 10 条,跟它放了多久毫无关系。
+
+        拿年龄当判据的后果是:信号要 30 天后才出现,
+        而这期间用户看到的是一切正常 —— 跟 missed 的失效模式一模一样。
+        """
+        return self.excluded > 0 and self.indexed == 0 and self.injected == 0
+
+    @property
+    def is_dead_weight(self) -> bool:
+        """死重:进过索引(有机会被想起),却始终没被拉过全文。"""
+        return self._aged and self.indexed > 0 and self.injected == 0
 
     def health(self) -> str:
         if self.status == "needs_rewrite" or self.is_rotten:
             return "rotten"
+        if self.is_starved_index:
+            return "starved_index"
         if self.is_dead_weight:
             return "dead"
+        if self.starved >= STARVE_THRESHOLD:
+            return "starved"
         if self.missed >= RECUR_THRESHOLD:
             return "missed"
         return "ok"
@@ -397,8 +514,11 @@ class Layer:
             signatures=list(d.get("signatures") or []),
             created=str(d.get("created") or ""),
             injected=int(stats.get("injected") or 0),
+            indexed=int(stats.get("indexed") or 0),
+            excluded=int(stats.get("excluded") or 0),
             recurred=int(stats.get("recurred") or 0),
             missed=int(stats.get("missed") or 0),
+            starved=int(stats.get("starved") or 0),
             helped=int(stats.get("helped") or 0),
             last_injected=str(stats.get("last_injected") or ""),
             last_recurred=str(stats.get("last_recurred") or ""),
@@ -534,8 +654,11 @@ class Layer:
             signatures=list(d.get("signatures") or []),
             created=d.get("created", ""),
             injected=int(stats.get("injected") or 0),
+            indexed=int(stats.get("indexed") or 0),
+            excluded=int(stats.get("excluded") or 0),
             recurred=int(stats.get("recurred") or 0),
             missed=int(stats.get("missed") or 0),
+            starved=int(stats.get("starved") or 0),
             helped=int(stats.get("helped") or 0),
             last_injected=str(stats.get("last_injected") or ""),
             last_recurred=str(stats.get("last_recurred") or ""),
@@ -685,7 +808,7 @@ class Layer:
             for lesson_id, key, n in entries:
                 e = d.setdefault(lesson_id, {})
                 e[key] = int(e.get(key) or 0) + int(n)
-                if key in ("injected", "recurred"):
+                if key in ("injected", "indexed", "recurred"):
                     e["last_" + key] = ts
             self._write_stats(d)
         # 计数变了(文件签名没变),进程缓存必须失效
@@ -848,6 +971,11 @@ class Layer:
         """
         if not self._inj_path.exists():
             return set()
+        if not session:
+            # 会话身份未知(见 session_id())。无法判断任何一条注入
+            # "当时在不在上下文里" —— 返回空集比按最近时间瞎猜更诚实。
+            # 归因会因此只走骨架路径,不做 recurrence 判定。
+            return set()
         cutoff = dt.datetime.now() - dt.timedelta(minutes=window_min)
         out: set = set()
         for line in self._inj_path.read_text(
@@ -897,19 +1025,51 @@ def _jaccard(a: set, b: set) -> float:
     return inter / union if union else 0.0
 
 
+# 高频虚词 —— 中文二元组会把它们切出来,而它们在【任何】句子里都出现,
+# 于是贡献的是噪声不是相关度。实测:
+#
+#   "我要设一个超时阈值"   与 "当你要写一个数字阈值时"  → 2 分
+#   "我要设一个重试次数阈值" 与 同一条                  → 也是 2 分
+#
+# 两次共有的都是「一个」+「阈值」,而"超时"和"重试次数"的差别被
+# 虚词抹平了 —— **打分器在分辨两条相关经验时,靠的是噪声。**
+# 这跟 min_overlap 那条原则是同一个问题:宁可漏报,不要给出误导性匹配。
+#
+# 只放【真正哪里都出现】的词。范围宁可小:误删一个实词是静默漏检
+# (而 missed 计数就是用来暴露漏检的),留着虚词则是假阳性。
+# 刻意**不**包含「一个」「可以」「我们」之外的任何两字组合 ——
+# 「数据」「系统」这类词看着泛,但在某些库里有实义,删了会误伤。
+_ZH_STOP = {
+    "一个", "一些", "一种", "一次", "一下", "什么", "怎么", "如何",
+    "这个", "那个", "这些", "那些", "这样", "那样", "这是",
+    "可以", "需要", "应该", "必须", "可能", "已经", "还是", "或者",
+    "因为", "所以", "但是", "如果", "然后", "就是", "不是", "没有",
+    "我们", "你们", "他们", "自己", "现在", "时候", "问题", "情况",
+    "进行", "通过", "对于", "关于", "以及", "而且", "并且", "并且",
+}
+_EN_STOP = {"the", "and", "for", "with", "that", "this", "you", "are",
+            "not", "but", "can", "will", "when", "your", "have", "from"}
+
+
 def _terms(text: str) -> set:
     """切成检索词。中文用二元组 —— 无需词典,零依赖,
     对「追读率」「风格锁」这类自定义术语够用。
+
+    **虚词必须剔除。** 二元组把「一个」「可以」这类词也切了出来,
+    它们在任何句子里都出现,于是"相关"和"都提到了同一批虚词"
+    变成同一件事。见 _ZH_STOP 里的实测数据。
     """
     s = re.sub(r"[^\w一-鿿]+", " ", (text or "").lower())
     words: set = set()
     for chunk in s.split():
         if re.match(r"^[一-鿿]+$", chunk):
             for i in range(len(chunk) - 1):
-                words.add(chunk[i:i + 2])
+                gram = chunk[i:i + 2]
+                if gram not in _ZH_STOP:
+                    words.add(gram)
             if len(chunk) == 1:
                 words.add(chunk)
-        elif len(chunk) > 1:
+        elif len(chunk) > 1 and chunk not in _EN_STOP:
             words.add(chunk)
     return words
 
@@ -924,11 +1084,32 @@ HEALTH_LABEL = {
     "missed": "检索漏检",
     "dead": "死重",
     "rotten": "反复复发",
+    "starved": "投递饿死",
+    "starved_index": "索引饿死",
 }
+# 严重度顺序 —— CLI 分组、网页分组共用，必须一致。
+HEALTH_ORDER = ["rotten", "starved", "starved_index", "missed", "dead", "ok"]
+# 分组标题。**后两类刻意写明"不是经验的错"**：它们的现象和 dead 一样
+# (注入 0 次)，但处方相反 —— 当成死重去删，会删掉一批只是没排上队的经验。
+HEALTH_HEAD = {
+    "rotten":        "反复复发 —— 注入了还是犯,fix 不可执行",
+    "missed":        "检索漏检 —— 触发词写偏了,该命中没命中",
+    "starved":       "投递饿死 —— 签名命中了却没送到,不是 trigger 的问题",
+    "starved_index": "索引饿死 —— 索引装不下,它从没露过面(别删)",
+    "dead":          f"死重 —— 进过索引却 {DEAD_WEIGHT_DAYS} 天没被拉过全文",
+    "ok":            "正常",
+}
+# **每一类的"怎么办"必须写清楚,尤其是 starved 那两条。**
+# 前四类的处方都是"改经验本身";后两类恰恰相反 —— 经验没问题,
+# 坏的是投递策略或容量。混为一谈会让人删掉/改坏本来有用的经验。
 HEALTH_ACTION = {
     "rotten": "注入了还是反复犯 —— fix 多半不可执行,重写它。",
     "missed": "该命中却没命中 —— 触发词写偏了,用你实际会想到的词重写。",
-    "dead": "记了 30 天从没被检索到 —— 考虑删掉或合并进相近的经验。",
+    "dead": "进过索引却从没被拉过全文 —— 考虑删掉或合并进相近的经验。",
+    "starved": ("签名精确命中过,做法却从没送到模型手上 —— "
+                "**不是 trigger 的问题,别改它**;查投递链路。"),
+    "starved_index": ("索引装不下,它从没露过面 —— "
+                      "扩容量或提优先级,**不要删这条经验**。"),
     "ok": "",
 }
 
@@ -1038,7 +1219,24 @@ class Library:
         return [l for _, l in scored[:limit]]
 
     def by_signature(self, sig: str) -> List[Lesson]:
+        """挂了签名且精确命中的经验。
+
+        **这是库里唯一的确定性匹配。** 二元组检索是启发式的,会假阳性;
+        签名是结构化的(路径、数字、引号内容都归一化了),命中即"同一种失败"。
+        所以投递和归因都应该优先走它 —— 见 ATTRIBUTION_MODE 的说明。
+        """
+        if not sig:
+            return []
         return [l for l in self.all() if sig in l.signatures]
+
+    def relevant(self, context: str, limit: int = 2,
+                 min_overlap: int = 4) -> List[Lesson]:
+        """语义相关。归因专用:只认高重合,宁漏勿错。
+
+        `min_overlap` 卡在 4(而非 query 默认的 2)是刻意的 ——
+        归因写错比不写更坏,误判会让人去"修"一条本来没问题的经验。
+        """
+        return self.query(context, limit=limit, min_overlap=min_overlap)
 
     # ── 导出量:现算,不存 ──────────────────────────
     #
@@ -1122,6 +1320,35 @@ class Library:
         out.sort(key=lambda x: -x[0])
         return out
 
+    def attribute(self, l: Lesson, mode: str, seen_content: Optional[bool],
+                  pending: List[Tuple[Lesson, str, int]]) -> str:
+        """给一次失败归因。返回记下的信号名。
+
+        **两个维度,四个格子** —— 把 mode 和 seen_content 分开之后,
+        每个格子都是一个独立的、有明确处置的问题:
+
+                         看过做法            没看过做法
+          骨架命中   recurred  → 改 fix      starved  → 改投递
+          语义命中   recurred  → 改 fix      missed   → 改 trigger
+
+        重点是**右下角**:骨架命中但没送正文,绝不能再记 missed。
+        签名撞上了是硬证据,这条 trigger 一个字都不需要改 ——
+        该改的是"为什么它没被送达"。
+
+        `seen_content` 为 None 表示会话身份未知,无从判断看没看过 ——
+        此时只有骨架模式敢下"确定是它、却没送达"的结论,记 starved;
+        语义模式退回 missed(它本来就是个弱信号,不必再帮它猜)。
+        依据见 session_id()。
+        """
+        if seen_content is True:
+            pending.append((l, "recurred", 1))
+            return "recurred"
+        if mode == "skeleton":
+            pending.append((l, "starved", 1))
+            return "starved"
+        pending.append((l, "missed", 1))
+        return "missed"
+
     def bump(self, l: Lesson, key: str, n: int = 1) -> None:
         """给一条经验加计数。同时更新内存对象和本机 stats.json。
 
@@ -1137,7 +1364,7 @@ class Library:
         ts = _now()
         for l, key, n in entries:
             setattr(l, key, getattr(l, key, 0) + n)
-            if key in ("injected", "recurred"):
+            if key in ("injected", "indexed", "recurred"):
                 setattr(l, "last_" + key, ts)
             # n 必须逐条带上 —— 见 bump_many 的说明
             by_layer.setdefault(l.layer, []).append((l.id, key, n))
@@ -1157,6 +1384,10 @@ class Library:
             "rotten": sum(1 for l in items if l.health() == "rotten"),
             "dead": sum(1 for l in items if l.health() == "dead"),
             "missed": sum(1 for l in items if l.health() == "missed"),
+            "starved": sum(1 for l in items if l.health() == "starved"),
+            "starved_index": sum(
+                1 for l in items if l.health() == "starved_index"),
+            "indexed": sum(1 for l in items if l.indexed > 0),
             "injections": sum(l.injected for l in items),
             "recurred": sum(l.recurred for l in items),
         }
@@ -1234,11 +1465,47 @@ def require_any_layer(lib: Library) -> None:
         f'  或只记全局经验: exp add "<标题>" --layer global')
 
 
-def session_id() -> str:
-    # Claude Code 会把会话信息放进环境变量;没有就用进程组兜底
-    return (os.environ.get("CLAUDE_SESSION_ID")
+def session_id(payload: Optional[Dict[str, Any]] = None) -> str:
+    """当前会话的标识。**注入记账和归因全靠它对上号。**
+
+    取值的优先级,以及为什么只能这样排:
+
+      1. hook 的 stdin payload —— Claude Code 每个 hook 事件都带
+         `session_id`,这是**权威且必然存在**的来源。
+      2. 环境变量 —— 手工跑 CLI(exp query / exp show)时没有 payload,
+         只能靠它。注意这个变量**未必设了**,不能再往下假设。
+
+    **环境变量的名字是 `CLAUDE_CODE_SESSION_ID`,不是 `CLAUDE_SESSION_ID`。**
+    后者不存在,永远读不到东西。上一版只查了它,于是所有【手工调用】的
+    注入都记在空会话名下 —— 而"模型主动查过没有"恰恰是靠手工调用
+    (`exp query`)产生的信号,等于把要量的那个量本身弄丢了。
+    `CLAUDE_CODE_SESSION_ID` 在 2.1.132+ 才加,所以两个都查。
+
+    **绝不能用 `pid{getppid()}` 兜底。** 踩过的坑:上一版这么写过,
+    而它是静默失效的 ——
+
+      hook 命令是 `python3 x.py || python x.py`,中间隔着一层 shell。
+      实测在 git-bash 下每次调用都新起一个中间 shell,于是 **ppid 每次
+      都不同**(9024 / 10516 / 1848 …)。后果:
+
+        第 1 次失败  → 注入记在 pid9024 名下
+        第 2 次失败  → 去 pid10516 名下找注入记录 → 找不到
+                     → 归因判定"模型没看过做法" → 记 missed
+
+      于是 `recurred` **恒为 0**,所有签名精确命中的复发都被记成
+      "触发词写偏了",gc 再据此让人去改一条本来没问题的 trigger。
+
+    所以:**拿不到可靠会话就返回空串**,让归因显式地放弃判断 ——
+    宁可暂时不归因,也不能拿一个错的 id 去污染计数。
+    """
+    if payload:
+        sid = payload.get("session_id") or payload.get("sessionId")
+        if sid:
+            return _scrub(str(sid))
+    return (os.environ.get("CLAUDE_CODE_SESSION_ID")   # 权威名字
+            or os.environ.get("CLAUDE_SESSION_ID")     # 第三方发明的,通常恒空
             or os.environ.get("CLAUDE_SESSIONID")
-            or f"pid{os.getppid()}")
+            or "")
 
 
 # ── 渲染 ───────────────────────────────────────────
@@ -1257,13 +1524,34 @@ def render_index(lib: Library, max_items: int = INDEX_MAX_ITEMS,
     if not items:
         return "", []
 
-    # 优先:hig 严重度 → 复发 → 近期注入
+    # 索引排序。**每一档都对应一种"它值得占一格"的理由**,顺序即优先级:
+    #
+    #   1. 高严重度   —— 撞上代价大
+    #   2. 项目级     —— 只对这个仓库成立(与 query 打分一致,全局层降权)
+    #   3. **用过的** —— 被证明能用上的,优先占位
+    #   4. starved    —— 饿死过的,打破自我锁定
+    #   5. created    —— 老的先来
+    #   6. id         —— 兜底确定性
+    #
+    # 第 3 条的依据很直接:"库的价值不是条数,是被命中过多少条"。
+    # 一条从来没人查过的经验,占着格子挤掉一条天天用的,是净损失。
+    #
+    # 第 4 条打破一个死循环:被容量挤掉的经验 indexed 恒为 0,
+    # 若再让它排在最后,就"越饿死越靠后,越靠后越饿死"。
+    #
+    # **第 5 条是稳定性,不是美观。** 上一版拿 `l.title` 当最后的
+    # tiebreak,于是同档条目按字符串排 —— `经验46` < `经验5` < `经验6`,
+    # 跟新旧、重要性都无关。后果是**在中间插一条新经验会让整个
+    # dropped 集合重新洗牌**,而 dropped 决定谁"从没露过面"。
+    # 用 created 排序,新经验不会无故把老经验挤出去,截断结果可预测。
     def rank(l: Lesson):
         return (
             0 if l.severity == "high" else 1,
             0 if l.layer == "project" else 1,
-            -l.recurred,
-            l.title,
+            0 if l.injected > 0 else 1,
+            0 if l.starved > 0 else 1,
+            l.created or "9999",
+            l.id,
         )
 
     items.sort(key=rank)
@@ -1284,11 +1572,10 @@ def render_index(lib: Library, max_items: int = INDEX_MAX_ITEMS,
         if len(shown_ids) >= max_items:
             dropped_reason = f"超出 {max_items} 条上限"
             break
-        mark = ""
-        if l.health() == "rotten":
-            mark = " [!]反复复发"
-        elif l.is_dead_weight:
-            mark = " [--]从未命中"
+        # 标注必须带上"这是哪一类问题"—— 只说"坏"模型会当噪声忽略,
+        # 说了是哪一类它才知道该不该照做(rotten 的 fix 是明确不该照做的)。
+        h = l.health()
+        mark = f" [{HEALTH_LABEL[h]}]" if h != "ok" else ""
         flag = "" if l.status == "confirmed" else " (未验证)"
         row = (f"- **{l.title}**{flag}{mark}\n"
                f"  何时适用: {(l.trigger or '未填').splitlines()[0] if l.trigger else '未填'}\n")
@@ -1305,13 +1592,19 @@ def render_index(lib: Library, max_items: int = INDEX_MAX_ITEMS,
     # 于是它们的 missed 永远算不出来 —— 库里显示"一切正常",
     # 而实际上有一批经验从来没机会出现。
     #
-    # 报告出来,你才知道该跑 exp cluster 了。
+    # **但"报告"不等于"警告"。** 上一版写的是"索引已满,跑 exp cluster
+    # 看哪些该合并" —— 那是给**维护者**看的,而读这段文字的是**模型**,
+    # 它既不会跑 cluster,也不会去合并经验。它只会把这句当噪声。
+    #
+    # 对模型有用的只有一件事:**知道库比它看到的列表大,以及怎么够到剩下的**。
+    # 被截断的经验依然能被 `exp query` 检索到 —— 它们只是没常驻而已。
+    # 这一点说清楚,截断就从"静默失效"变成了"已知的不完整"。
     dropped = len(items) - len(shown_ids)
     if dropped > 0:
         lines.append(
-            f"\n**索引已满({dropped_reason})，有 {dropped} 条未注入。**"
-            f"\n这不是正常的 —— 未注入的经验无法被验证。跑 `exp cluster` "
-            f"看哪些该合并，或 `exp gc` 清理死重。\n"
+            f"\n> 这里只列出 {len(shown_ids)} 条({dropped_reason});"
+            f"库里共 {len(items)} 条。"
+            f"\n> 没列出的用 `exp query \"<你要做什么>\"` 一样能检索到。\n"
         )
     return "\n".join(lines), shown_ids
 
@@ -1451,7 +1744,14 @@ def cmd_hook(args: argparse.Namespace) -> int:
     **未激活时静默退出。** 插件是全局安装的,但机制只在有 .exp/ 的
     项目里生效 —— 否则它会在无关项目里捕获噪声。
     静默是必须的:hook 的 stdout 会被塞进上下文,不能有杂音。
+
+    **stdin 只读一次**,读到的 payload 在这里分发给各个 handler ——
+    它是会话身份(`session_id`)的权威来源,而身份决定归因能不能对上号。
+    每个 handler 各读一次 stdin 会读到空(流已经耗尽),那正是
+    `pid{getppid()}` 那个 bug 的温床。
     """
+    payload = _read_stdin_json()
+
     lib = Library(find_project_root())
     if not lib.enabled:
         return 0
@@ -1460,12 +1760,16 @@ def cmd_hook(args: argparse.Namespace) -> int:
     if layer is None:
         return 0          # enabled 已经保证了不会是 None,防御性兜底
 
+    sid = session_id(payload)
+
     if args.event == "session-start":
-        return _hook_session_start(lib, layer)
+        return _hook_session_start(lib, layer, sid)
     if args.event == "post-failure":
-        return _hook_post_failure(lib, layer)
+        return _hook_post_failure(lib, layer, payload, sid)
+    if args.event == "user-prompt":
+        return _hook_user_prompt(lib, layer, payload, sid)
     if args.event == "stop":
-        return _hook_stop(lib, layer)
+        return _hook_stop(lib, layer, payload, sid)
     return 0
 
 
@@ -1479,16 +1783,27 @@ def _save_in_layer(lib: Library, l: Lesson) -> None:
             return
 
 
-def _hook_session_start(lib: Library, layer: Layer) -> int:
+def _hook_session_start(lib: Library, layer: Layer, sid: str = "") -> int:
     block, ids = render_index(lib)
     if not block or not ids:
         return 0
     # level="index":模型看到的只有标题和触发词,没看到 fix。
     # 所以这次的注入只能用于判定 missed,不能用于判定 recurred。
-    layer.log_injection(ids, "session-start:index", session_id(), level="index")
+    layer.log_injection(ids, "session-start:index", sid, level="index")
     # 一次写盘,不是 N 次 —— 见 Layer.bump_many
+    #
+    # 记的是 **indexed** 而不是 injected:"进过索引"和"看过正文"是
+    # 两件事,分开记才分得清"死重"(有机会却没读)和"索引饿死"
+    # (连机会都没有)。见 Lesson.is_starved_index。
+    #
+    # **没挤进去的也要记**(excluded)。这是"被容量挤掉"的**唯一确凿证据** ——
+    # 它发生在渲染的那一刻,是事实而不是推断,所以立刻就能报,
+    # 不用像死重那样等 30 天。
     shown = set(ids)
-    lib.bump_all((l, "injected", 1) for l in lib.all() if l.id in shown)
+    lib.bump_all(
+        (l, "indexed" if l.id in shown else "excluded", 1)
+        for l in lib.all()
+    )
 
     out = {
         "hookSpecificOutput": {
@@ -1500,15 +1815,28 @@ def _hook_session_start(lib: Library, layer: Layer) -> int:
     return 0
 
 
-def _hook_post_failure(lib: Library, layer: Layer) -> int:
+def _hook_post_failure(lib: Library, layer: Layer,
+                       payload: Optional[Dict[str, Any]] = None,
+                       sid: str = "") -> int:
     """失败发生的那一刻 —— 唯一适合记账的时机。
 
     这里做三件事,而且【全部无 LLM】:
       1. 算签名
-      2. 归因:recurred(注入了还犯) / missed(该注入没注入)
-      3. 落原始事件
+      2. 归因:recurred / starved / missed
+      3. 落原始事件 + 把做法送给模型
+
+    ── 检索:只有一条路径,两档精度 ──────────────────
+    上一版有个隐蔽的错位 —— **归因和投递各用各的检索器**:
+
+        归因 → by_signature(精确)     投递 → query(模糊)
+
+    于是一条挂了签名的经验可以被 by_signature 抓去归因,却因为
+    二元组匹配不上 trigger 而**送不到模型手上**,然后被记成 missed。
+    系统一边说"这条经验该出现",一边又不让它出现,还怪它的 trigger 写得不好。
+
+    现在两处都走同一个查询函数,顺序也一致:先骨架,后语义。
     """
-    payload = _read_stdin_json()
+    payload = payload or {}
     # _scrub 是必须的:代理字符会让后面 json.dumps 写文件时抛异常,
     # 而这整条路径挂了 = 归因静默失效(详见 _scrub 的说明)
     tool = _scrub(str(payload.get("tool_name") or payload.get("tool") or "?"))
@@ -1522,63 +1850,62 @@ def _hook_post_failure(lib: Library, layer: Layer) -> int:
     code = _scrub(str(payload.get("exit_code", payload.get("error_type", ""))))
     sig = signature(tool, err, code)
 
-    sess = session_id()
+    # 会话身份未知时无法判断"看没看过",归因退化为只认骨架命中。
+    sess = sid or session_id()
+    known_session = bool(sess)
     indexed = layer.recent_injections(sess, level="index")
     content = layer.recent_injections(sess, level="content")
     now = _now()
-    touched: List[Lesson] = []
 
-    # ── 归因 A:签名命中 ────────────────────────────
-    # 这条失败以前【确切见过】。签名是结构化的(路径、数字、引号内容都归一化了),
-    # 所以换个措辞的同一种坑也能对上。
-    #
-    # 判定用 content 而非 index:只有模型【看过做法】之后还犯,
-    # 才说明这条经验的 fix 不可执行。只看到标题不算 ——
-    # 那多半是它判断这条跟自己无关,那是触发词的问题,记为 missed。
-    promote: List[Lesson] = []
     # 所有计数攒起来,最后【一次写盘】—— 逐条 bump 是 N 次全文件读写
     pending: List[Tuple[Lesson, str, int]] = []
+    promote: List[Lesson] = []
+    touched: List[Lesson] = []
 
+    # ── 顺序很关键:归因必须【先于】投递 ──────────────
+    #
+    # 两者都读 `content`(本会话送过的正文),而投递会往里写。
+    # 如果先投递再归因,同一次失败就会看到"自己刚送出去的那条",
+    # 于是把"失败发生时才第一次送达"误判成"看过做法还是犯" ——
+    # 凭空造出一个 recurred。
+    #
+    # 正确语义是:**失败发生的那一刻,上下文里有什么**。
+    # 所以先按这个快照归因,再把做法送出去。这决定了
+    # `starved` 的含义 —— "这次失败时它还没送到过",而不是"永远没送到"。
+
+    def _record(l: Lesson, mode: str) -> None:
+        """按 mode × 看没看过 归因,并在该降级时登记。
+
+        `seen_content` 为 None 时 attribute 会按模式保守处理 ——
+        详见 Layer.attribute 的四个格子。
+        """
+        seen = (l.id in content) if known_session else None
+        got = lib.attribute(l, mode, seen, pending)
+        touched.append(l)
+        if got == "recurred" and (l.recurred + 1 >= RECUR_THRESHOLD
+                                  and l.status == "confirmed"):
+            l.status = "needs_rewrite"
+            promote.append(l)
+
+    # ── 归因 A:骨架命中(确定性)──────────────────
+    # 签名是结构化的(路径、数字、引号内容都归一化了),
+    # 命中即"这是同一种失败" —— 换个措辞的同一个坑也能对上。
     for l in lib.by_signature(sig):
-        if l.id in content:
-            # 看过做法还是犯 → fix 不可执行
-            pending.append((l, "recurred", 1))
-            touched.append(l)
-            if l.recurred + 1 >= RECUR_THRESHOLD and l.status == "confirmed":
-                l.status = "needs_rewrite"
-                promote.append(l)
-        else:
-            pending.append((l, "missed", 1))   # 库里却没到手上 → 触发词写偏了
-            touched.append(l)
+        _record(l, "skeleton")
 
-    # ── 归因 B:没有签名时的兜底 ────────────────────
+    # ── 归因 B:语义命中(启发式兜底)────────────────
+    # 签名只能靠 `exp distill` 从原始事件里抄,门槛很高,所以
+    # 绝大多数经验是没签名的。只用 A 的话它们的 recurred 永远算不出来。
     #
-    # 背景:**签名只能靠 `exp distill` 从原始事件里抄,门槛很高。**
-    # 绝大多数经验是没签名的 —— 如果只靠签名归因,那些经验
-    # 永远无法被判定"有没有用",`recurred` 就形同虚设。
-    #
-    # 所以这里用失败信息本身当检索词,按相关度分两种情况:
-    #
-    #   高度相关 + 注入过   → recurred(看了还是犯,fix 不可执行)
-    #   高度相关 + 没注入过 → missed  (该到手上却没到)
-    #
-    # min_overlap 卡得很高(4 而非默认 2)。归因写错比不写更坏 ——
-    # 误判会让人去"修"一条本来没问题的经验。
+    # 用失败信息本身当检索词。min_overlap 卡在 4(而非默认 2):
+    # 归因写错比不写更坏 —— 误判会让人去"修"一条本来没问题的经验。
+    # 这条判断对 B 成立;对 A 不成立,所以 A 不记 missed,见 Layer.attribute。
     if not touched and str(err).strip():
         try:
-            near = lib.query(f"{tool} {err}", limit=2, min_overlap=4)
+            for l in lib.relevant(f"{tool} {err}", limit=2):
+                _record(l, "related")
         except Exception:
-            near = []
-        for l in near:
-            if l.id in content:
-                # 看过做法还是犯 —— 和归因 A 的判据一致
-                pending.append((l, "recurred", 1))
-                if l.recurred + 1 >= RECUR_THRESHOLD and l.status == "confirmed":
-                    l.status = "needs_rewrite"
-                    promote.append(l)
-            else:
-                pending.append((l, "missed", 1))
-            touched.append(l)
+            pass
 
     # 计数一次落盘
     try:
@@ -1606,31 +1933,241 @@ def _hook_post_failure(lib: Library, layer: Layer) -> int:
         "content": sorted(content),
     })
 
-    # 输出:给模型一句提示。
+    # ── 投递:把做法送到模型眼前 ────────────────────
     #
     # **必须走 stderr + 退出码 2。** PostToolUseFailure 的语义是
     # "exit 2 会把 stderr 送给 Claude";普通 stdout 到不了模型那里。
     # 这里不会阻断任何东西 —— 工具已经失败了,没有可阻断的动作。
-    hint = lib.query(f"{tool} {err}", limit=1, min_overlap=3)
+    #
+    # 查询顺序与上面归因一致:先骨架(精确),再语义(模糊)。
+    # 这条通道是**唯一不依赖模型自觉**的正文投递 —— README 承诺
+    # "这三件事不依赖任何人的自觉",而在此之前它恰恰没记账,
+    # 于是模型真的读到了做法,系统却当没送过,recurred 永远算不出来。
+    hint = lib.by_signature(sig)[:1]
+    if not hint:
+        try:
+            hint = lib.query(f"{tool} {err}", limit=1, min_overlap=3)
+        except Exception:
+            hint = []
     if hint:
         l = hint[0]
         if l.fix:
+            # 送达即记账 —— 否则上面那句承诺是空的
+            layer.log_injection([l.id], "post-failure:hint", sess,
+                                level="content")
             print(f"[exp] 这个坑记过:{l.title}\n"
                   f"  做法: {l.fix.splitlines()[0]}", file=sys.stderr)
             return 2
+        return 0
+
+    # ── 库里没有对应经验 —— 但 raw 知道这是不是重复的 ──────
+    #
+    # 这是投递路径上最大的一个漏洞,补上它靠的是一个**已经存在的事实**:
+    #
+    #   签名在【失败发生的那一刻】就算出来了,而且落进了 raw/。
+    #   它只是从没被用来匹配 —— 匹配只发生在 `by_signature(经验)` 上,
+    #   而那条路径要求经验**先挂上签名**。于是:
+    #
+    #     raw 里躺着"这是同一种失败"的结构性确证,
+    #     投递却在用两个同样失效的启发式检索器找一条从没挂过它的经验。
+    #
+    # 后果是第 2 次踩坑和第 1 次【完全同形】:exit 0、什么都不送。
+    # 系统手里握着"你犯过这个错"的硬证据,却保持沉默。
+    #
+    # 语义兜底(query, min_overlap=3)救不了这个 —— 实测 0/6:
+    # 报错信息描述的是**症状**,trigger 描述的是**你正要做什么**,
+    # 这两套词汇在设计上就不相交。签名之所以是"唯一的确定性匹配",
+    # 正是因为它绕开了这个矛盾。
+    #
+    # 所以这里【不加新的启发式】,只把 raw 里的结构性事实接回来:
+    # 同一签名出现到阈值就说话。这条判据冷启动期也能工作 ——
+    # 它不要求库里先有任何东西。
+    # **报错文本为空时不参与。** 那样的签名是退化的(`Bash||`),
+    # 所有"没有报错的失败"都会塌缩到同一个签名上 —— 它不是
+    # "同一种失败"的证据,是"没有信息"。在这里说话就是假阳性,
+    # 而假阳性比不提示更坏:它让模型去记一条其实没发生过第二次的
+    # "重复"。跟 min_overlap 卡在 4 是同一条原则。
+    if not str(err).strip() or not str(sig).strip():
+        return 0
+    today = dt.date.today().isoformat()
+    try:
+        evs = [e for e in layer.raw_events(since=today)
+               if str(e.get("ts", "")).startswith(today)]
+    except Exception:
+        return 0
+    same = [e for e in evs
+            if e.get("kind") == "failure" and e.get("signature") == sig]
+    if len(same) < REPEAT_HINT_THRESHOLD:
+        return 0
+    # **只说一次。** 第 3、4 次再报就是纯噪声了 —— 模型已经知道了,
+    # 而它此刻需要的是把精力花在解决问题上。用 raw 记一笔"提过了",
+    # 不另开状态文件:raw 本来就是机器遥测的地方。
+    if any(e.get("kind") == "repeat_hint" and e.get("signature") == sig
+           for e in evs):
+        return 0
+    try:
+        layer.append_raw({
+            "ts": now, "kind": "repeat_hint", "session": sess,
+            "signature": sig, "n": len(same),
+        })
+    except Exception:
+        pass
+
+    # 带工具名和报错原文 —— 签名里的 <STR> 是归一化过的,
+    # 只给签名的话模型得自己猜它对应刚才哪条报错。
+    first = str(err).splitlines()[0][:160] if str(err).strip() else ""
+    print(f"[exp] 这个坑今天第 {len(same)} 次撞上,而库里没有对应经验:\n"
+          f"  {sig}\n"
+          + (f"  ← {first}   (工具: {tool})\n" if first else "")
+          + "  现在记下来,下次再撞上就直接有做法了:\n"
+          f'    exp add "<标题>" --from-raw "{sig}" \\\n'
+          f'        --trigger "当你...时" --fix "<具体怎么做>"',
+          file=sys.stderr)
+    return 2
+
+
+def render_lessons_for_prompt(hits: List[Lesson],
+                              max_chars: int = PRE_ACTION_MAX_CHARS
+                              ) -> Tuple[str, List[str]]:
+    """把命中经验的**正文**渲染成任务前注入块。返回 (文本, 实际列出的 id)。
+
+    和 `render_index` 的区别是这里的目的是**直接能用** ——
+    不是"知道有这么条经验",而是"照这个做"。所以给全文三段
+    (何时适用 / 根因 / 做法),而不是标题 + 触发词。
+
+    **措辞刻意是陈述句,不是祈使句。** 注入的文本来自本地文件,
+    但防御机制只看形状 —— "你必须在动手前做 X"这类命令式措辞
+    容易撞上提示注入检测,反而让整段被丢掉。陈述事实不会有这个问题。
+
+    返回实际列出的 id:被预算截掉的不该被记成注入过,
+    否则 recurred 会算在一条模型根本没看到的经验头上。
+    """
+    if not hits:
+        return "", []
+    lines = [
+        "## 经验库:与本次任务相关的条目(exp)",
+        "",
+        "检索到这几条历史和当前任务相关,列在下面供参考:",
+        "",
+    ]
+    used = sum(len(x) for x in lines)
+    shown: List[str] = []
+    for l in hits:
+        h = l.health()
+        mark = f" [{HEALTH_LABEL[h]}]" if h != "ok" else ""
+        flag = "" if l.status == "confirmed" else " (未验证)"
+        body = [f"### {l.title}{flag}{mark}", ""]
+        if l.trigger:
+            body.append(f"- 何时适用: {l.trigger.splitlines()[0]}")
+        if l.root_cause:
+            body.append(f"- 根因: {l.root_cause.splitlines()[0]}")
+        if l.fix:
+            # 做法是这条经验的价值所在 —— 多给几行,其余段落不展开
+            body.append("- 做法:")
+            body.extend(f"    {ln}" for ln in l.fix.splitlines()[:6])
+        body.append(f"- 全文: `exp show {l.id}`")
+        body.append("")
+        chunk = "\n".join(body) + "\n"
+        if used + len(chunk) > max_chars and shown:
+            break
+        lines.append(chunk)
+        used += len(chunk)
+        shown.append(l.id)
+    return "\n".join(lines), shown
+
+
+def _hook_user_prompt(lib: Library, layer: Layer,
+                      payload: Optional[Dict[str, Any]] = None,
+                      sid: str = "") -> int:
+    """任务前投递 —— **"按需加载"的那个"按需"。**
+
+    ── 为什么必须是这个事件 ──────────────────────────
+
+    这是唯一能真正在【动作之前】把经验送进上下文的通道。
+
+    PreToolUse 看着更合适(它知道具体要跑什么),但它的
+    `additionalContext` 是和工具结果**同一次**送达的 ——
+    模型看到经验时,那条命令已经跑完了。这是 Messages API 的结构
+    决定的:tool_result 必须紧跟 tool_use,中间没有位置可插。
+    所以 PreToolUse 能改参数、能拦,但不能【提前告知】。
+
+    UserPromptSubmit 在模型处理 prompt 之前触发,additionalContext
+    随 prompt 进上下文。代价是它只看得到用户的自然语言,看不到
+    tool_input —— 这个交换划算:看得见的意图远不如到得及的时机重要。
+
+    ── 与 SessionStart 的分工 ────────────────────────
+
+      SessionStart   全量索引(标题 + 触发词)  → 让模型【知道库存在】
+      UserPromptSubmit 命中条目的全文          → 让模型【现在就能用】
+
+    前者是"有这么些坑",后者是"这条和你正要做的有关,做法是这样"。
+    """
+    prompt = _scrub(str((payload or {}).get("prompt") or ""))
+    if not prompt.strip():
+        return 0
+
+    # 长 prompt(贴进来的文件、大段日志)会让二元组命中率虚高 ——
+    # 共同的常用字凑够阈值太容易了,那是假阳性不是相关。
+    # 截断到前 2000 字符:意图通常在开头,而尾部是粘贴的内容。
+    probe = prompt[:2000]
+
+    # **本会话已经送过正文的,不再重复送。**
+    # additionalContext 会留在会话历史里 —— 同一轮里反复注入同一条,
+    # 不是提醒,是纯噪声,而且每轮都在烧上下文。
+    seen = layer.recent_injections(sid, level="content") if sid else set()
+
+    try:
+        hits = lib.query(probe, limit=PRE_ACTION_MAX_LESSONS * 3,
+                         min_overlap=PRE_ACTION_MIN_OVERLAP)
+    except Exception:
+        return 0
+
+    # 三个过滤,每个都对应一种"送过去只有坏处"的情况:
+    #   没 fix        —— 模型知道了也做不了什么,而正文长度的价值全在 fix
+    #   已送过        —— 见上
+    #   rotten        —— fix 已知不可执行(反复复发到阈值),不能当做法推
+    hits = [l for l in hits
+            if l.fix and l.id not in seen and not l.is_rotten]
+    hits = hits[:PRE_ACTION_MAX_LESSONS]
+    if not hits:
+        return 0
+
+    block, shown = render_lessons_for_prompt(hits)
+    if not block or not shown:
+        return 0
+
+    # 记账必须是 **content** 级 —— 模型看到的是根因和做法,不是标题。
+    # 这条记账让 recurred 有了全新的、更严格的含义:
+    # "任务开始前就把做法给过你了,你还是踩了"。
+    try:
+        layer.log_injection(shown, "user-prompt:pre-action", sid,
+                            level="content")
+        lib.bump_all((l, "injected", 1) for l in hits if l.id in set(shown))
+    except Exception:
+        pass       # 记账失败不该影响投递
+
+    print(json.dumps({
+        "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": block,
+        }
+    }, ensure_ascii=False))
     return 0
 
 
-def _hook_stop(lib: Library, layer: Layer) -> int:
+def _hook_stop(lib: Library, layer: Layer,
+               payload: Optional[Dict[str, Any]] = None,
+               sid: str = "") -> int:
     """收工时把本次会话的原始事件归拢成候选。
 
     **不调用 LLM。** 候选整理出来交给 agent 自己归纳 ——
     宿主里那个模型比任何外部调用都更懂当前语境。
     """
+    sess = sid or session_id(payload or {})
     today = dt.date.today().isoformat()
     events = [e for e in layer.raw_events(since=today)
               if e.get("kind") == "failure"
-              and e.get("session") == session_id()
+              and (not sess or e.get("session") == sess)
               and str(e.get("ts", "")).startswith(today)]
     if len(events) < 2:
         return 0
@@ -1665,6 +2202,7 @@ def cmd_query(args: argparse.Namespace) -> int:
         # 才算得上"这条经验的 fix 不可执行"。
         layer.log_injection([l.id for l in hits], f"query:{' '.join(args.context)}",
                             session_id(), level="content")
+        # injected 只计**正文**投递 —— 索引那次算 indexed,见 session-start。
         lib.bump_all((l, "injected", 1) for l in hits)
     for l in hits:
         tag = "全局" if l.layer == "global" else "项目"
@@ -1679,7 +2217,8 @@ def cmd_query(args: argparse.Namespace) -> int:
                 print(f"   做法: {line}")
         if l.health() != "ok":
             print(f"   [!] 健康度: {l.health()}"
-                  f" (注入{l.injected}/复发{l.recurred}/漏检{l.missed})")
+                  f" (索引{l.indexed}/注入{l.injected}/复发{l.recurred}"
+                  f"/漏检{l.missed}/饿死{l.starved})")
         print(f"   全文: exp show {l.id}")
         print()
     return 0
@@ -1700,7 +2239,8 @@ def cmd_show(args: argparse.Namespace) -> int:
     print(f"# {l.title}")
     print(f"[{tag}] {l.category} · {l.status} · "
           f"{l.severity or '未标严重度'} · {l.health()}")
-    print(f"注入 {l.injected} / 复发 {l.recurred} / 漏检 {l.missed} / 有用 {l.helped}")
+    print(f"索引 {l.indexed} / 注入 {l.injected} / 复发 {l.recurred} / "
+          f"漏检 {l.missed} / 饿死 {l.starved} / 有用 {l.helped}")
     if l.trigger:
         print(f"\n## 何时适用\n\n{l.trigger}")
     for heading, attr in _SECTIONS[1:]:
@@ -1739,13 +2279,12 @@ def cmd_list(args: argparse.Namespace) -> int:
     # 健康度是算出来的(不会腐烂),而且它才是你真正要动手处理的东西。
     # 主题分类需要"其他"桶,所以这里不给它位置。
     if args.by == "health":
-        order = {"rotten": 0, "missed": 1, "dead": 2, "ok": 3}
-        label = {
-            "rotten": "反复复发 —— 注入了还是犯,fix 不可执行",
-            "missed": "检索漏检 —— 触发词写偏了,该命中没命中",
-            "dead":   f"死重 —— {DEAD_WEIGHT_DAYS} 天从没被命中过",
-            "ok":     "正常",
-        }
+        # **只用一份定义。** 这里原来是第三份手写的健康度映射,
+        # 加了新档位忘了同步它 —— 于是 `exp list` 直接 KeyError 崩掉。
+        # 分组顺序和文案统一从 HEALTH_ORDER / HEALTH_HEAD 取,
+        # 那是 CLI、网页、gc 共用的唯一来源。
+        order = {k: i for i, k in enumerate(HEALTH_ORDER)}
+        label = HEALTH_HEAD
         items.sort(key=lambda l: (order.get(l.health(), 9),
                                   l.layer != "project", l.title))
         cur = None
@@ -1775,20 +2314,47 @@ def cmd_list(args: argparse.Namespace) -> int:
             if l.status != "confirmed":
                 flags.append(l.status)
             if l.health() != "ok":
-                flags.append({"rotten": "反复复发", "dead": "死重",
-                              "missed": "检索漏检"}[l.health()])
+                flags.append(HEALTH_LABEL.get(l.health(), l.health()))
             tail = f"  [{', '.join(flags)}]" if flags else ""
             print(f"  {l.severity or '-':6} {l.title}{tail}")
-            print(f"         注入{l.injected} 复发{l.recurred} 漏检{l.missed}")
+            print(f"         索引{l.indexed} 注入{l.injected} "
+                  f"复发{l.recurred} 漏检{l.missed} 饿死{l.starved}")
     st = lib.stats()
     print(f"\n合计 {st['total']} 条 "
           f"(项目 {st['project']} / 全局 {st['global']}) · "
           f"确认 {st['confirmed']} · 复发 {st['rotten']} · "
           f"死重 {st['dead']}")
+    if st.get("starved") or st.get("starved_index"):
+        print(f"另有:投递饿死 {st['starved']} · 索引饿死 {st['starved_index']}"
+              f"(这两类都【不是】经验本身的问题,别改 trigger)")
     return 0
 
 
 # ── 命令:add ───────────────────────────────────────
+def _raw_signature_index(layer: Layer) -> Dict[str, Dict[str, Any]]:
+    """raw 里真实出现过的签名 → {n, sample, tool}。
+
+    `--from-raw` 靠它校验。**抄错的签名是个静默的坏钩子** ——
+    失败发生时 `by_signature` 找不到它,归因和投递都当这条经验不存在,
+    而库里显示一切正常。跟 `missed` 是同一种失效模式,所以宁可报错。
+    """
+    out: Dict[str, Dict[str, Any]] = {}
+    try:
+        events = [e for e in layer.raw_events() if e.get("kind") == "failure"]
+    except Exception:
+        return out
+    for e in events:
+        s = str(e.get("signature") or "")
+        if not s:
+            continue
+        d = out.setdefault(s, {"n": 0, "sample": "", "tool": ""})
+        d["n"] += 1
+        if not d["sample"]:
+            d["sample"] = str(e.get("error") or "")
+            d["tool"] = str(e.get("tool") or "")
+    return out
+
+
 def cmd_add(args: argparse.Namespace) -> int:
     lib = load_library()
     layer = lib.project_layer if args.layer == "project" else lib.global_layer
@@ -1809,6 +2375,26 @@ def cmd_add(args: argparse.Namespace) -> int:
     if not args.trigger:
         warn("没填 --trigger,这条经验几乎检索不到 —— 检索靠它。")
 
+    # ── 签名:手抄 + 从 raw 抄 ──────────────────────
+    #
+    # 签名是【唯一确定性】的匹配依据,但只能从 `exp distill` 的输出里
+    # 手抄 —— 门槛高到大多数经验干脆不挂。`--from-raw` 去掉这一步。
+    sigs = list(args.signature or [])
+    wanted = list(getattr(args, "from_raw", None) or [])
+    if wanted:
+        known = _raw_signature_index(layer)
+        for s in wanted:
+            if s not in known:
+                near = [k for k in known if s[:24] in k] or list(known)[:10]
+                die(f"raw 里没有这个签名:\n    {s}\n"
+                    f"  抄错的签名是个永远不命中的【静默】坏钩子 ——\n"
+                    f"  失败时匹配不上,系统当这条经验不存在。\n"
+                    f"  raw 里现有 {len(known)} 类签名:\n"
+                    + "".join(f"    {k}\n" for k in near)
+                    + "  完整列表:`exp distill`")
+            if s not in sigs:
+                sigs.append(s)
+
     l = Lesson(
         id=_slug(args.title),
         layer=layer.name,
@@ -1822,7 +2408,7 @@ def cmd_add(args: argparse.Namespace) -> int:
         fix=args.fix or "",
         evidence=args.evidence or "",
         scope=args.scope or "",
-        signatures=list(args.signature or []),
+        signatures=sigs,
         created=dt.date.today().isoformat(),
     )
     if (layer.lessons_dir / f"{l.id}.md").exists():
@@ -1941,6 +2527,34 @@ def cmd_feedback(args: argparse.Namespace) -> int:
     return 0
 
 
+def _index_capacity(lib: Library) -> Dict[str, Any]:
+    """索引装得下吗?
+
+    这是【最隐蔽的失效模式】的可视化:索引满了 → 有经验永远不会被注入
+    → 它们的 missed 永远算不出来 → 库里显示"一切正常",
+    而实际有一批经验从来没机会出现。
+
+    `exp gc` / `exp cluster` / 网页面板都报它 —— 三个界面必须对
+    "库里有没有问题"给出同一个答案。
+    """
+    _, shown = render_index(lib)
+    total = len([l for l in lib.all()])
+    # **报出真正生效的那条约束。** 上一版固定写"条数上限 120",
+    # 而实际卡住的往往是字符预算 —— 报错的限制器会把人引向错误的处置。
+    if len(shown) >= INDEX_MAX_ITEMS:
+        bound = f"最多 {INDEX_MAX_ITEMS} 条"
+    else:
+        bound = f"{INDEX_MAX_CHARS} 字符预算"
+    return {
+        "capacity": INDEX_MAX_ITEMS,
+        "chars": INDEX_MAX_CHARS,
+        "bound": bound,
+        "total": total,
+        "shown": len(shown),
+        "dropped": max(0, total - len(shown)),
+    }
+
+
 def cmd_gc(args: argparse.Namespace) -> int:
     """体检:把坏经验和死重列出来。
 
@@ -1948,6 +2562,7 @@ def cmd_gc(args: argparse.Namespace) -> int:
     """
     lib = load_library()
     st = lib.stats()
+    capacity = _index_capacity(lib)
     print(f"合计 {st['total']} 条(项目 {st['project']} / 全局 {st['global']})")
     print(f"确认 {st['confirmed']} · 未验证 {st['hypothesis']} · "
           f"已推翻 {st['refuted']}")
@@ -1955,13 +2570,15 @@ def cmd_gc(args: argparse.Namespace) -> int:
 
     rotten = [l for l in lib.all() if l.health() == "rotten"]
     missed = [l for l in lib.all() if l.health() == "missed"]
-    dead = [l for l in lib.all() if l.is_dead_weight]
+    starved = [l for l in lib.all() if l.health() == "starved"]
+    dead = [l for l in lib.all() if l.health() == "dead"]
+    starved_index = [l for l in lib.all() if l.health() == "starved_index"]
 
     if rotten:
         print(f"── 反复复发 ({len(rotten)}) —— 注入了还是犯,fix 多半不可执行 ──")
         for l in rotten:
             print(f"  {l.title}")
-            print(f"    注入{l.injected} 复发{l.recurred} · {l.path}")
+            print(f"    索引{l.indexed} 注入{l.injected} 复发{l.recurred} · {l.path}")
         print()
     if missed:
         print(f"── 检索漏检 ({len(missed)}) —— trigger 写偏了,该命中没命中 ──")
@@ -1969,10 +2586,52 @@ def cmd_gc(args: argparse.Namespace) -> int:
             print(f"  {l.title}  (漏检{l.missed})")
             print(f"    现在写的触发词: {l.trigger[:70]}")
         print()
+    if starved:
+        print(f"── 投递饿死 ({len(starved)}) —— 签名精确命中过,做法却没送到模型手上 ──")
+        print(f"  注意:这类**不是** trigger 的问题,签名是精确匹配的,"
+              f"改 trigger 没有用。")
+        for l in starved:
+            print(f"  {l.title}  (饿死{l.starved} · 注入{l.injected})")
+            print(f"    签名: {', '.join(l.signatures[:2]) or '无'}")
+        print("  处置:查为什么没送达 —— 通常是会话身份丢失,"
+              "或投递通道没记账。")
+        print()
+    if starved_index:
+        print(f"── 索引饿死 ({len(starved_index)}) —— 索引装不下,"
+              f"它们从没露过面 ──")
+        print(f"  索引上限 {INDEX_MAX_ITEMS} 条。这些**被挤掉过**"
+              f"(excluded),一次都没进去:",
+              f"{starved_index[0].excluded} 次" if len(starved_index) == 1
+              else f"最多的被挤掉 {max(l.excluded for l in starved_index)} 次")
+        for l in starved_index:
+            print(f"  {l.title}  (被挤掉 {l.excluded} 次)")
+        print("  处置:扩容量、提优先级,或该上分层了 —— **不是**删经验。")
+        print()
+    # ── 容量告警:今天就报,不等 30 天 ─────────────────
+    #
+    # 上面那类是"已经确认被挤掉过"的个体。这里报的是**结构本身** ——
+    # 只要库比容量大,就一定有人排不进去,哪怕它今天才刚写。
+    #
+    # 为什么必须当场报:容量溢出是**算术事实**,不是使用模式。
+    # 50 条经验、上限 40 条,今天就排除了 10 条 —— 跟它们放了多久无关。
+    # 等 30 天再报,中间这段时间用户看到的是一切正常,
+    # 而这正是 README 里说的那种最隐蔽的失效模式(信号算不出来 ≠ 没事)。
+    if capacity["dropped"] > 0:
+        print(f"── 容量告警 —— 库比索引大,必有经验排不进去 ──")
+        print(f"  {capacity['total']} 条经验,索引受限于 {capacity['bound']},"
+              f"当前列出 {capacity['shown']} 条,"
+              f"排除 {capacity['dropped']} 条。")
+        print(f"  被排除的仍能被 `exp query` 检索到 —— 只是不常驻。")
+        print(f"  但它们的 missed 永远算不出来(主动检索不会跑到它们),")
+        print(f"  所以【库里没问题】是假象。")
+        print(f"  处置:条数受限于字符预算就调高 INDEX_MAX_CHARS;")
+        print(f"        确实需要更多条目就调 INDEX_MAX_ITEMS;")
+        print(f"        或者把通用的经验挪到全局层、合并同类。")
+        print()
     if dead:
-        print(f"── 死重 ({len(dead)}) —— 记了 {DEAD_WEIGHT_DAYS} 天从没被命中过 ──")
+        print(f"── 死重 ({len(dead)}) —— 进过索引,{DEAD_WEIGHT_DAYS} 天没被拉过全文 ──")
         for l in dead:
-            print(f"  {l.title}  (创建 {l.created})")
+            print(f"  {l.title}  (创建 {l.created} · 进过索引 {l.indexed} 次)")
         print()
 
     # ── 数据健康 ────────────────────────────────────
@@ -2006,14 +2665,17 @@ def cmd_gc(args: argparse.Namespace) -> int:
         print("  修法:补上 `---` 包裹的 frontmatter,或删掉该文件。")
         print()
 
-    if not (rotten or missed or dead or dup or unreadable):
+    if not (rotten or missed or starved or starved_index or dead
+            or dup or unreadable):
         print("没有需要处理的。")
     else:
         print("处置建议:")
-        print("  复发 → 重写 fix,让它可执行;或降级为 hypothesis")
-        print("  漏检 → 重写 trigger,用你实际会想到的词")
-        print("  死重 → 删掉,或合并进相近的经验")
-        print("  重名 → 改 id 或合并")
+        print("  复发     → 重写 fix,让它可执行;或降级为 hypothesis")
+        print("  漏检     → 重写 trigger,用你实际会想到的词")
+        print("  投递饿死 → 查投递链路(会话身份 / 记账),**不要**改 trigger")
+        print("  索引饿死 → 扩容量或提优先级,**不要**删经验")
+        print("  死重     → 删掉,或合并进相近的经验")
+        print("  重名     → 改 id 或合并")
     return 0
 
 
@@ -2226,25 +2888,6 @@ def cmd_import(args: argparse.Namespace) -> int:
 
 
 # ── 命令:serve(网页) ──────────────────────────────
-def _index_capacity(lib: Library) -> Dict[str, Any]:
-    """索引装得下吗?
-
-    这是【最隐蔽的失效模式】的可视化:索引满了 → 有经验永远不会被注入
-    → 它们的 missed 永远算不出来 → 库里显示"一切正常",
-    而实际有一批经验从来没机会出现。
-
-    CLI 的 `exp cluster` 会报它,页面也必须报 —— 否则两个界面
-    对"库里有没有问题"给出不同答案。
-    """
-    _, shown = render_index(lib)
-    total = len([l for l in lib.all()])
-    return {
-        "capacity": INDEX_MAX_ITEMS,
-        "chars": INDEX_MAX_CHARS,
-        "total": total,
-        "shown": len(shown),
-        "dropped": max(0, total - len(shown)),
-    }
 
 
 def cmd_serve(args: argparse.Namespace) -> int:
@@ -2279,8 +2922,10 @@ def cmd_serve(args: argparse.Namespace) -> int:
                 "symptom": l.symptom, "root_cause": l.root_cause,
                 "fix": l.fix, "evidence": l.evidence, "scope": l.scope,
                 "related": l.related, "created": l.created,
-                "injected": l.injected, "recurred": l.recurred,
-                "missed": l.missed, "helped": l.helped,
+                "injected": l.injected, "indexed": l.indexed,
+                "recurred": l.recurred,
+                "missed": l.missed, "starved": l.starved,
+                "helped": l.helped,
                 "last_injected": l.last_injected,
                 "last_recurred": l.last_recurred,
                 "health": l.health(),
@@ -2503,7 +3148,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(fn=cmd_init)
 
     s = sub.add_parser("hook", help="hook 入口,由 Claude Code 调用")
-    s.add_argument("event", choices=["session-start", "post-failure", "stop"])
+    s.add_argument("event", choices=["session-start", "post-failure",
+                                     "user-prompt", "stop"])
     s.set_defaults(fn=cmd_hook)
 
     s = sub.add_parser("query", help="按上下文检索经验")
@@ -2519,7 +3165,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--layer", choices=["project", "global"])
     s.add_argument("--category", choices=CATEGORIES)
     s.add_argument("--status", choices=STATUSES)
-    s.add_argument("--health", choices=["ok", "rotten", "dead", "missed"])
+    s.add_argument("--health", choices=list(HEALTH_LABEL))
     s.add_argument("--by", default="health", choices=["health", "category"],
                    help="分组方式。默认 health(算出来的,不会腐烂);"
                         "category 是主题,只适合人工翻阅")
@@ -2540,6 +3186,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--signature", action="append", default=[],
                    help="失败签名,可重复。挂上它之后,同样的失败再出现时"
                         "会自动记为复发。签名从 exp distill 的输出里抄。")
+    s.add_argument("--from-raw", dest="from_raw", action="append", default=[],
+                   help="从 raw 事件里抄一个签名挂上,可重复。"
+                        "与 --signature 的区别是**会校验该签名确实出现过** —— "
+                        "抄错的签名是个永远不命中的静默坏钩子。")
     s.set_defaults(fn=cmd_add)
 
     s = sub.add_parser("distill", help="把原始事件归拢成候选经验")
