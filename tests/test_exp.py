@@ -13,6 +13,8 @@
 """
 from __future__ import annotations
 
+import argparse
+import io
 import json
 import os
 import subprocess
@@ -43,6 +45,17 @@ class Base(unittest.TestCase):
         self.expdir.mkdir()
         exp.Layer.clear_memo()
 
+        # 会话身份必须由 hook payload 提供。清掉环境变量,免得开发机上
+        # 真设了 CLAUDE_SESSION_ID 时测试"碰巧通过" —— 那正是上一版
+        # 漏掉 session_id bug 的原因:测试替真实环境把变量补上了。
+        # CLAUDE_CODE_SESSION_ID 是**权威名字**(2.1.132+ 才加),
+        # 也必须清 —— 否则在真实会话里跑测试时,开发机的变量会漏进
+        # 被测代码,让某些用例"碰巧通过"。这正是上一版漏掉
+        # session_id bug 的机制,不能再犯第二次。
+        for k in ("CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID",
+                  "CLAUDE_SESSIONID"):
+            os.environ.pop(k, None)
+
         # 把全局层指到临时目录 —— 绝不碰真实的 ~/.exp/
         self._old_global = exp.GLOBAL_DIR
         exp.GLOBAL_DIR = Path(self.tmp.name) / "global"
@@ -60,6 +73,52 @@ class Base(unittest.TestCase):
         l = exp.Layer(self.expdir, "project")
         l.ensure()
         return l
+
+    # ── 真实 hook 入口 ─────────────────────────────
+    #
+    # **归因相关的测试一律走这里,不要另抄一份逻辑。**
+    # 上一版在 TestAttribution 里手抄了归因分支,于是测的是抄本 ——
+    # 真正的 hook 路径从没被覆盖,`session_id()` 那个致命 bug
+    # 因此藏了很久。这些 helper 放在 Base 上,谁都能用。
+    def hook(self, event, payload):
+        """模拟 CLI 调用 hook:真读 stdin,真走 cmd_hook。
+
+        返回 (exit_code, stdout, stderr) —— 退出码本身是契约的一部分
+        (post-failure 靠 exit 2 把做法送给模型)。
+        """
+        class _Stdin:
+            def __init__(self, data):
+                self.buffer = io.BytesIO(data)
+
+            def read(self):
+                return self.buffer.read().decode("utf-8")
+
+        raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        out, err = io.StringIO(), io.StringIO()
+        with unittest.mock.patch.object(sys, "stdin", _Stdin(raw)), \
+                unittest.mock.patch.object(sys, "stdout", out), \
+                unittest.mock.patch.object(sys, "stderr", err), \
+                unittest.mock.patch.object(exp, "find_project_root",
+                                           lambda start=None: self.expdir):
+            code = exp.cmd_hook(argparse.Namespace(event=event))
+        exp.Layer.clear_memo()
+        return code, out.getvalue(), err.getvalue()
+
+    def start(self, session="S1"):
+        """跑一次 SessionStart hook。"""
+        return self.hook("session-start", {"session_id": session})
+
+    def fail(self, session="S1", tool="Bash", err="boom", code="1"):
+        """跑一次 PostToolUseFailure hook。"""
+        return self.hook("post-failure", {
+            "session_id": session, "tool_name": tool,
+            "error": err, "exit_code": code,
+        })
+
+    def lesson(self, title):
+        """重读一条经验(绕过缓存),拿到最新计数。"""
+        self.lib()
+        return self.lib().get(title)
 
     def add(self, title, **kw):
         l = self.layer()
@@ -210,138 +269,189 @@ class TestQuery(Base):
 
 # ── 归因(项目核心)─────────────────────────────────
 class TestAttribution(Base):
-    def _fail(self, lib, tool, err, code=1):
-        """直接调用归因路径,不经过 subprocess。"""
-        layer = lib.project_layer
-        sig = exp.signature(tool, err, code)
-        sess = exp.session_id()
-        content = layer.recent_injections(sess, level="content")
+    """归因 —— 项目核心。
 
-        pending, promote = [], []
-        for l in lib.by_signature(sig):
-            if l.id in content:
-                pending.append((l, "recurred", 1))
-                if l.recurred + 1 >= exp.RECUR_THRESHOLD and l.status == "confirmed":
-                    l.status = "needs_rewrite"
-                    promote.append(l)
-            else:
-                pending.append((l, "missed", 1))
-        lib.bump_all(pending)
-        for l in promote:
-            lib._layers_save(l) if hasattr(lib, "_layers_save") else None
-        return sig
+    **这些用例走真实入口 `cmd_hook`,绝不重抄一份归因逻辑。**
 
-    def test_recurred_requires_content_injection(self):
-        """看过做法还是犯 → 记为复发。
+    上一版这里有个 `_fail()`,把生产代码的归因分支原样抄了一遍,
+    于是测的是抄本而非实现 —— 真正的 hook 路径从来没被覆盖过。
+    后果是 `session_id()` 那个致命 bug 藏了很久:
 
-        只有 content 级注入才算 —— 只看到标题不算,
-        那说明模型判断这条跟自己无关,那是触发词的问题。
+        hook 命令经过一层 shell,每次调用的 getppid() 都不同
+        → 第 2 次失败去另一个 pid 名下找注入记录 → 永远找不到
+        → `recurred` 恒为 0,所有签名命中都被误记成 missed
+
+    而且旧测试手工调 `log_injection(..., exp.session_id())`、
+    又在开发机上碰巧有 CLAUDE_SESSION_ID,等于替真实环境把变量补上了。
+    所以:**从 stdin 进,从计数器出。**
+    """
+
+    # ── 地基:会话身份 ──────────────────────────────
+
+    def test_session_id_comes_from_payload(self):
+        """身份以 payload 为准 —— 它是每个 hook 事件都带的权威来源。"""
+        self.assertEqual(exp.session_id({"session_id": "abc"}), "abc")
+
+    def test_session_id_never_fabricates_from_pid(self):
+        """**拿不到会话时返回空,不能编一个 pid。**
+
+        这是那个 bug 的核心:pid{getppid()} 每次都变,于是两次失败
+        永远对不上号,而症状是静默的 —— recurred 恒为 0,
+        表面看只是"还没有坏经验"。宁可显式返回空。
         """
-        les = self.add("会复发的坑", status="confirmed",
-                       trigger="当你做某事时", signatures=["Bash|1|boom"])
-        lib = self.lib()
-        layer = lib.project_layer
-        layer.log_injection([les.id], "test", exp.session_id(), level="content")
-        exp.Layer.clear_memo()
+        sid = exp.session_id({})
+        self.assertEqual(sid, "", "没有会话信息时不该造一个 id 出来")
+        self.assertNotIn("pid", sid)
 
-        lib = self.lib()
-        self._fail(lib, "Bash", "boom")
-        self.assertEqual(self.lib().get("会复发的坑").recurred, 1)
+    def test_same_session_spans_separate_hook_processes(self):
+        """注入和归因发生在**两次独立的进程**里,必须能对上号。
 
-    def test_missed_when_only_index_injected(self):
-        """只注入了索引(没给做法)就犯 → 记为漏检,不是复发。"""
+        这条用例如果不走真实入口就永远测不出来 —— 正是上一版的问题。
+        """
+        les = self.add("会复发的坑", status="confirmed", trigger="当你做某事时",
+                       fix="这样做", signatures=["Bash|1|boom"])
+        self.start("S1")                    # 进程 A:注入索引
+        self.fail("S1")                     # 进程 B:失败 → 得能看见 A 的注入
+
+        # 第一次失败:骨架精确命中但正文还没送过 → 饿死,不是漏检
+        got = self.lesson("会复发的坑")
+        self.assertEqual(got.starved, 1)
+        self.assertEqual(got.missed, 0, "签名是精确匹配的,不该怪 trigger")
+        self.assertEqual(got.recurred, 0)
+
+    # ── 闭环:全自动,不依赖模型自觉 ─────────────────
+
+    def test_closed_loop_without_any_voluntary_action(self):
+        """**核心承诺**:三件事不依赖任何人的自觉。
+
+        模型从头到尾没主动跑过 exp query / exp show,只靠 hook,
+        recurred 也必须能自己长出来。
+        """
+        self.add("会复发的坑", status="confirmed", trigger="当你做某事时",
+                 fix="这样做", signatures=["Bash|1|boom"])
+        self.start("S1")
+
+        code, _, err = self.fail("S1")
+        self.assertEqual(code, 2, "第一次失败就该把做法送给模型")
+        self.assertIn("这样做", err)
+
+        self.fail("S1")                     # 又犯一次
+        got = self.lesson("会复发的坑")
+        self.assertEqual(got.recurred, 1,
+                         "做法已送达又再犯 → 复发,全自动闭合")
+        self.assertEqual(got.missed, 0)
+
+    def test_hint_delivery_is_recorded(self):
+        """投递了就要记账 —— 否则"送过"和"没送过"分不清,recurred 永远算不出来。"""
+        self.add("会复发的坑", trigger="当你做某事时", fix="这样做",
+                 signatures=["Bash|1|boom"])
+        self.start("S1")
+        self.fail("S1")
+
+        inj = (self.expdir / "injections.jsonl").read_text(encoding="utf-8")
+        self.assertIn("post-failure:hint", inj)
+        self.assertIn("S1", inj)
+
+    def test_auto_demotion_at_threshold(self):
+        """复发到阈值 + confirmed → **自动降级** needs_rewrite。全自动。"""
+        self.add("反复复发的坑", status="confirmed", trigger="当你做某事时",
+                 fix="这样做", signatures=["Bash|1|boom"])
+        self.start("S1")
+        for _ in range(exp.RECUR_THRESHOLD + 1):
+            self.fail("S1")
+
+        got = self.lesson("反复复发的坑")
+        self.assertEqual(got.status, "needs_rewrite")
+        self.assertEqual(got.health(), "rotten")
+
+    # ── 归因的四个格子 ─────────────────────────────
+
+    def test_skeleton_hit_never_records_missed(self):
+        """**骨架精确命中的岔子只可能是投递问题,不是 trigger 问题。**
+
+        这条守着 gc 的诊断正确性:签名撞上了是硬证据,这条 trigger
+        一个字都不用改。如果记成 missed,gc 会建议"重写触发词",
+        用户就会去改一个完全没问题的字段 —— 误诊比不诊断更坏。
+        """
+        self.add("阈值必须有来源", status="confirmed",
+                 trigger="当你准备在配置里写一个数字阈值时",
+                 signatures=["Bash|1|boom"])          # 注意:不给 fix
+        self.start("S1")
+        self.fail("S1")
+        self.fail("S1")
+
+        got = self.lesson("阈值必须有来源")
+        self.assertGreater(got.starved, 0)
+        self.assertEqual(got.missed, 0)
+        self.assertEqual(got.health(), "starved")
+
+    def test_recurred_requires_content_not_just_index(self):
+        """只看到标题不算看过做法 —— 那是触发词的问题,不是 fix 的问题。"""
         les = self.add("只见过标题的坑", status="confirmed",
                        trigger="当你做某事时", signatures=["Bash|1|boom"])
         lib = self.lib()
-        lib.project_layer.log_injection([les.id], "test", exp.session_id(),
-                                        level="index")
+        lib.project_layer.log_injection([les.id], "manual", "S1", level="index")
         exp.Layer.clear_memo()
 
-        lib = self.lib()
-        self._fail(lib, "Bash", "boom")
-        got = self.lib().get("只见过标题的坑")
+        self.fail("S1")
+        got = self.lesson("只见过标题的坑")
+        self.assertEqual(got.recurred, 0, "只看过标题不算看过做法")
+        self.assertEqual(got.starved, 1, "骨架命中 + 没送正文 → 投递饿死")
+
+    def test_missed_without_signature(self):
+        """没挂签名 + 语义没命中 → 这才是真的 missed(trigger 该改)。"""
+        self.add("不要用 var 声明变量", status="confirmed",
+                 trigger="当你写 JavaScript 变量声明时",
+                 fix="用 const 或 let")
+        self.start("S1")
+        # 失败信息与这条经验高度相关,但它是靠语义匹配上的
+        self.fail("S1", tool="Write", err="不要用 var 声明变量", code="")
+
+        got = self.lesson("不要用 var 声明变量")
         self.assertEqual(got.missed, 1)
-        self.assertEqual(got.recurred, 0)
-
-    def test_auto_demotion_at_threshold(self):
-        """复发到阈值 + confirmed → **自动降级** needs_rewrite。"""
-        les = self.add("反复复发的坑", status="confirmed",
-                       trigger="当你做某事时", signatures=["Bash|1|boom"])
-        for _ in range(exp.RECUR_THRESHOLD):
-            lib = self.lib()
-            lib.project_layer.log_injection([les.id], "t", exp.session_id(),
-                                            level="content")
-            exp.Layer.clear_memo()
-            lib = self.lib()
-            pending, promote = [], []
-            content = {les.id}
-            for l in lib.by_signature("Bash|1|boom"):
-                if l.id in content:
-                    pending.append((l, "recurred", 1))
-                    if l.recurred + 1 >= exp.RECUR_THRESHOLD and l.status == "confirmed":
-                        l.status = "needs_rewrite"
-                        promote.append(l)
-            lib.bump_all(pending)
-            for l in promote:
-                for lay in lib.layers:
-                    if lay.name == l.layer:
-                        lay.save(l)
-            exp.Layer.clear_memo()
-
-        got = self.lib().get("反复复发的坑")
-        self.assertEqual(got.status, "needs_rewrite")
-        self.assertEqual(got.health(), "rotten")
+        self.assertEqual(got.starved, 0, "没签名就不该走骨架路径")
 
     def test_recurred_without_signature(self):
         """**没挂签名也要能判复发。**
 
         签名只能靠 `exp distill` 从原始事件里抄,门槛很高 ——
-        绝大多数经验是没签名的。如果归因只认签名,那些经验
-        永远无法被判定"有没有用",`recurred` 就形同虚设。
-
-        判据:失败信息与经验高度相关(重合 ≥4)**且**该经验注入过。
+        绝大多数经验是没签名的。只认签名的话,它们的 recurred 形同虚设。
         """
-        les = self.add("阈值必须有来源", status="confirmed",
-                       trigger="当你准备在配置里写一个数字阈值时",
-                       fix="先问这个数哪来的")
+        les = self.add("不要用 var 声明变量", status="confirmed",
+                       trigger="当你写 JavaScript 变量声明时", fix="用 const")
         lib = self.lib()
-        lib.project_layer.log_injection([les.id], "t", exp.session_id(),
+        lib.project_layer.log_injection([les.id], "manual", "S1",
                                         level="content")
         exp.Layer.clear_memo()
 
-        lib = self.lib()
-        # 模拟 hook 的归因 B:用失败信息去比对
-        content = lib.project_layer.recent_injections(
-            exp.session_id(), level="content")
-        near = lib.query("Edit 数字阈值必须有来源,不能凭感觉写",
-                         limit=2, min_overlap=4)
-        self.assertTrue(near, "高度相关的失败应该能命中这条经验")
-        pending = []
-        for l in near:
-            if l.id in content:
-                pending.append((l, "recurred", 1))
-            else:
-                pending.append((l, "missed", 1))
-        lib.bump_all(pending)
-
-        got = self.lib().get("阈值必须有来源")
-        self.assertEqual(got.recurred, 1, "注入过又犯,应记 recurred")
+        self.fail("S1", tool="Write", err="不要用 var 声明变量", code="")
+        got = self.lesson("不要用 var 声明变量")
+        self.assertEqual(got.recurred, 1, "看过做法又犯 → 复发")
         self.assertEqual(got.missed, 0)
 
-    def test_missed_without_signature(self):
-        """高度相关但从没注入过 → 记 missed。"""
-        les = self.add("不要用 var 声明变量", status="confirmed",
-                       trigger="当你写 JavaScript 变量声明时",
-                       fix="用 const 或 let")
-        lib = self.lib()
-        content = lib.project_layer.recent_injections(
-            exp.session_id(), level="content")
-        self.assertNotIn(les.id, content)
+    def test_unknown_session_does_not_blame_trigger(self):
+        """会话身份缺失时,骨架命中仍不该被记成 missed。
 
-        near = lib.query("Write 不要用 var 声明变量", limit=2, min_overlap=4)
-        self.assertTrue(near)
-        lib.bump_all([(l, "missed", 1) for l in near if l.id not in content])
-        self.assertEqual(self.lib().get("不要用 var 声明变量").missed, 1)
+        宁可少一个信号(starved 仍是有用信号),也不能把不确定
+        变成一条会误导人的诊断。
+        """
+        self.add("会复发的坑", trigger="当你做某事时",
+                 signatures=["Bash|1|boom"])
+        # 不带 session_id 的 payload
+        self.hook("post-failure", {"tool_name": "Bash", "error": "boom",
+                                   "exit_code": "1"})
+        got = self.lesson("会复发的坑")
+        self.assertEqual(got.missed, 0)
+        self.assertEqual(got.starved, 1)
+        self.assertEqual(got.recurred, 0, "身份未知不能断言看过还犯")
+
+    def test_lesson_without_signature_and_unrelated_failure_is_untouched(self):
+        """不相关的失败不该动任何计数 —— 归因宁可漏,不可错。"""
+        self.add("某条经验", trigger="当你处理数据库迁移时")
+        self.start("S1")
+        self.fail("S1", err="unrelated stack trace here")
+        got = self.lesson("某条经验")
+        self.assertEqual((got.recurred, got.missed, got.starved), (0, 0, 0))
 
     def test_low_overlap_does_not_attribute(self):
         """相关度不够时**不能**归因 —— 误判比不判更坏。"""
@@ -358,23 +468,396 @@ class TestAttribution(Base):
         self.assertEqual(a, b, "路径和行号应被归一化掉")
 
 
+class TestRepeatHint(Base):
+    """**库里没有对应经验时,重复失败必须被说出来。**
+
+    这是投递路径上最大的漏洞,而它此前【在任何测试里都没有覆盖】——
+    这正是它藏住的原因。
+
+    漏洞的形状:签名在失败发生的那一刻就算出来了,而且落进了 raw/,
+    但匹配只发生在 `by_signature(经验)` 上,而那条路径要求经验
+    先挂上签名。于是第 2 次踩坑和第 1 次完全同形:exit 0、什么都不送。
+    系统手里握着"你犯过这个错"的硬证据,却保持沉默。
+
+    这里所有用例都走真实 hook 入口(`self.fail`)——
+    跟 TestAttribution 一样的理由:抄一份逻辑来测等于没测。
+    """
+
+    def setUp(self):
+        super().setUp()
+        # **必须先建出 lessons/。** 一个空的 .exp/ 不算激活
+        # (见 TestLayers.test_empty_expdir_not_enabled)—— 不建的话
+        # cmd_hook 会静默返回 0,一条 raw 都记不下来,而这些用例
+        # 恰恰是在测"raw 里记了几次"。症状是全都返回 0,看起来像
+        # 提示逻辑没生效。
+        self.layer()
+
+    def test_first_occurrence_is_silent(self):
+        """第 1 次出现不提示 —— 那时无从判断它会不会重复,说什么都是噪声。"""
+        self.start("S1")
+        code, _, err = self.fail("S1", err="boom one")
+        self.assertEqual(code, 0, "第 1 次不该说话")
+        self.assertEqual(err, "")
+
+    def test_second_occurrence_speaks(self):
+        """第 2 次是「重复」被确证的那一刻 —— 必须说话。"""
+        self.start("S1")
+        self.fail("S1", err="boom one")
+        code, _, err = self.fail("S1", err="boom one")
+
+        self.assertEqual(code, 2, "第 2 次必须送到模型眼前")
+        self.assertIn("第 2 次", err)
+        self.assertIn("库里没有对应经验", err)
+        self.assertIn("--from-raw", err, "提示必须给出可执行的下一步")
+
+    def test_hint_carries_tool_and_raw_error(self):
+        """签名里的 <STR> 是归一化过的 —— 必须带上原文,否则模型认不出是哪条报错。"""
+        self.start("S1")
+        self.fail("S1", tool="Bash", err='psql: ERROR: relation "users" does not exist')
+        _, _, err = self.fail("S1", tool="Bash",
+                              err='psql: ERROR: relation "users" does not exist')
+        self.assertIn('relation "users" does not exist', err)
+        self.assertIn("Bash", err)
+
+    def test_hint_is_said_only_once(self):
+        """第 3、4 次再报就是纯噪声 —— 模型已经知道了。"""
+        self.start("S1")
+        self.fail("S1", err="boom one")
+        self.fail("S1", err="boom one")          # 第 2 次:说话
+        code, _, err = self.fail("S1", err="boom one")   # 第 3 次:闭嘴
+        self.assertEqual(code, 0)
+        self.assertNotIn("第 3 次", err)
+
+    def test_signature_lesson_wins_over_repeat_hint(self):
+        """有对应经验时走 fix 投递,不该走重复提示 —— 两条路不叠。"""
+        self.add("会复发的坑", trigger="当你做某事时", fix="这样做",
+                 signatures=["Bash|1|boom"])
+        self.start("S1")
+        self.fail("S1", err="boom")              # 有经验:送 fix
+        code, _, err = self.fail("S1", err="boom")
+        self.assertIn("这个坑记过", err)
+        self.assertNotIn("库里没有对应经验", err)
+
+    def test_unsignable_failure_is_silent(self):
+        """算不出签名的失败不参与 —— 没有签名就没法判断是不是重复。"""
+        self.start("S1")
+        for _ in range(3):
+            code, _, err = self.fail("S1", tool="", err="", code="")
+            self.assertEqual(code, 0)
+            self.assertEqual(err, "")
+
+
+class TestPreActionDelivery(Base):
+    """**任务前投递 —— "按需加载"的那个"按需"。**
+
+    这是唯一能真正在【动作之前】把经验送进上下文的通道:
+
+      SessionStart      全量索引(标题+触发词)  → 知道库存在
+      UserPromptSubmit  命中条目的【全文】      → 现在就能用
+      PostToolUseFailure 失败时送 fix           → 已经晚了
+
+    PreToolUse 看着更合适(知道要跑什么),但它的 additionalContext
+    是和工具结果【同一次】送达的 —— 模型看到经验时,命令已经跑完了。
+    这是 Messages API 的结构决定的,不是实现选择。所以这里的用例
+    打的是 UserPromptSubmit 这个真实入口。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.layer()
+
+    def prompt(self, text, session="S1"):
+        return self.hook("user-prompt", {"session_id": session,
+                                         "prompt": text})
+
+    def test_relevant_lesson_is_delivered_before_acting(self):
+        """相关时,把【正文】送到 —— 不是标题,是能照做的做法。"""
+        self.add("阈值必须有来源", status="confirmed",
+                 trigger="当你准备写一个数字阈值时",
+                 fix="先找到这个数字的来源:实测、SLA、还是行业惯例。找不到就先别写。")
+        code, out, _ = self.prompt("我要设一个超时阈值,该填多少")
+
+        self.assertEqual(code, 0)
+        payload = json.loads(out)
+        ctx = payload["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("阈值必须有来源", ctx)
+        self.assertIn("先找到这个数字的来源", ctx, "必须给做法,不是只给标题")
+        self.assertEqual(payload["hookSpecificOutput"]["hookEventName"],
+                         "UserPromptSubmit")
+
+    def test_irrelevant_prompt_stays_silent(self):
+        """不相关时【什么都不注入】—— 噪声会留在会话历史里,代价是持续的。"""
+        self.add("阈值必须有来源", trigger="当你准备写一个数字阈值时",
+                 fix="先找到来源")
+        code, out, _ = self.prompt("帮我把 README 的错别字改一下")
+        self.assertEqual(code, 0)
+        self.assertEqual(out, "", "不该注入任何东西")
+
+    def test_says_nothing_when_library_is_empty(self):
+        """空库不报错、不注入 —— 冷启动期的正常状态。"""
+        code, out, _ = self.prompt("帮我改个配置")
+        self.assertEqual((code, out), (0, ""))
+
+    def test_lesson_without_fix_is_not_delivered(self):
+        """没写做法的经验不推 —— 模型知道了也做不了什么,白占上下文。"""
+        self.add("某条没写做法的经验", trigger="当你准备写一个数字阈值时")
+        code, out, _ = self.prompt("我要设一个超时阈值")
+        self.assertEqual(out, "")
+
+    def test_rotten_lesson_is_not_delivered(self):
+        """反复复发过的经验不能当做法推 —— 它的 fix 已知不可执行。
+
+        索引里会标 [反复复发] 让模型自己判断,但**正文投递不行**:
+        正文投递的语气是"照这个做"。
+        """
+        self.add("坏掉的经验", status="confirmed",
+                 trigger="当你准备写一个数字阈值时", fix="这个做法没用")
+        les = self.lesson("坏掉的经验")
+        les.recurred = 99
+        self.layer().save(les)
+        exp.Layer.clear_memo()
+        code, out, _ = self.prompt("我要设一个超时阈值")
+        self.assertEqual(out, "", "坏经验不该被当成做法推出去")
+
+    def test_not_delivered_twice_in_same_session(self):
+        """**同一条经验在一个会话里只推一次。**
+
+        additionalContext 会留在会话历史里 —— 反复注入同一条不是提醒,
+        是纯噪声,而且每一轮都在烧上下文。
+        """
+        self.add("阈值必须有来源", status="confirmed",
+                 trigger="当你准备写一个数字阈值时", fix="先找到来源")
+        _, out1, _ = self.prompt("我要设一个超时阈值")
+        self.assertIn("阈值必须有来源", out1)
+
+        _, out2, _ = self.prompt("再帮我设一个重试次数阈值")
+        self.assertNotIn("阈值必须有来源", out2, "同一会话不重复推")
+
+    def test_delivered_again_in_a_new_session(self):
+        """换了会话就该重推 —— 上次那个会话的历史已经不在了。"""
+        self.add("阈值必须有来源", status="confirmed",
+                 trigger="当你准备写一个数字阈值时", fix="先找到来源")
+        _, out1, _ = self.prompt("我要设一个超时阈值", session="S1")
+        self.assertIn("阈值必须有来源", out1)
+        _, out2, _ = self.prompt("我要设一个超时阈值", session="S2")
+        self.assertIn("阈值必须有来源", out2, "新会话应重新投递")
+
+    def test_delivery_is_recorded_as_content_level(self):
+        """**记账必须是 content 级,而且必须记。**
+
+        记成 index 会让 recurred 永远算不出来;不记则这次投递
+        在数据上不存在 —— 而"送过做法还是犯"正是要量的东西。
+        这条投递让 recurred 有了更严格的含义:
+        任务【开始前】就给过做法了,你还是踩了。
+        """
+        self.add("阈值必须有来源", status="confirmed",
+                 trigger="当你准备写一个数字阈值时", fix="先找到来源")
+        self.prompt("我要设一个超时阈值")
+
+        inj = self.layer().recent_injections("S1", level="content")
+        self.assertIn("阈值必须有来源", inj)
+        got = self.lesson("阈值必须有来源")
+        self.assertEqual(got.injected, 1)
+
+    def test_empty_prompt_does_nothing(self):
+        """空 prompt 不参与 —— 没有上下文可检索。"""
+        self.add("阈值必须有来源", trigger="当你准备写一个数字阈值时",
+                 fix="先找到来源")
+        code, out, _ = self.prompt("   ")
+        self.assertEqual((code, out), (0, ""))
+
+
+class TestFromRaw(Base):
+    """`exp add --from-raw` —— 把 raw 里的签名接过来,替掉手抄。
+
+    签名是唯一确定性的匹配依据,却只能从 `exp distill` 的输出里手抄,
+    门槛高到大多数经验干脆不挂。这一步去掉手抄,但**必须校验** ——
+    抄错的签名是个永远不命中的静默坏钩子。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.layer()        # 空的 .exp/ 不算激活,必须先建出 lessons/
+        # raw 里先有真实失败记录
+        self.start("S1")
+        self.fail("S1", err='psql: ERROR: relation "users" does not exist')
+
+    def _add(self, **kw):
+        ns = argparse.Namespace(
+            title=kw.get("title", "改了 schema 没同步派生文件"),
+            category="其他", status="hypothesis", severity="",
+            trigger=kw.get("trigger", "当你修改数据库 schema 时"),
+            symptom="", root_cause="", fix=kw.get("fix", "改完跑 make gen"),
+            evidence="", scope="", layer="project",
+            signature=kw.get("signature", []),
+            from_raw=kw.get("from_raw", []),
+        )
+        # find_project_root 返回的是 **.exp/ 本身**(不是项目根),
+        # 所以这里给 self.expdir。
+        #
+        # lambda 必须能吃任意实参:load_library 里是 `find_project_root()`
+        # 无参调用,而 Base.hook 里是 `find_project_root(start)`。
+        # 签名写死成 `lambda start=None` 会在其中之一上抛 TypeError ——
+        # 而 load_library 把它包在 try/except 里,mock 的报错会被
+        # 当成"找不到项目"静默吞掉,最后报出来的是完全无关的错。
+        with unittest.mock.patch.object(exp, "find_project_root",
+                                        lambda *a, **k: self.expdir):
+            return exp.cmd_add(ns)
+
+    def test_from_raw_attaches_the_real_signature(self):
+        sig = exp.signature("Bash", 'psql: ERROR: relation "users" does not exist',
+                            "1")
+        self._add(from_raw=[sig])
+        got = self.lesson("改了 schema 没同步派生文件")
+        self.assertIn(sig, got.signatures)
+
+    def test_wrong_signature_is_rejected_not_silently_kept(self):
+        """**抄错的签名必须当场报错。**
+
+        静默收下它就等于造了个永远不命中的钩子:失败时 by_signature
+        找不到,归因和投递都当这条经验不存在,而库里显示一切正常 ——
+        跟 missed 是同一种失效模式。
+        """
+        with self.assertRaises(SystemExit):
+            self._add(from_raw=["Bash|1|这个签名根本不存在"])
+
+    def test_from_raw_signature_actually_matches_later_failure(self):
+        """端到端:抄来的签名必须真的能在后续失败时命中。"""
+        sig = exp.signature("Bash", 'psql: ERROR: relation "users" does not exist',
+                            "1")
+        self._add(from_raw=[sig])
+        code, _, err = self.fail("S1", tool="Bash",
+                                 err='psql: ERROR: relation "users" does not exist')
+        self.assertEqual(code, 2, "挂了签名之后这次必须送到模型眼前")
+        self.assertIn("这个坑记过", err)
+
+
 # ── 健康度 ─────────────────────────────────────────
 class TestHealth(Base):
-    def test_dead_weight_after_threshold_days(self):
-        old = ("2020-01-01")
-        self.add("很久没命中的经验", created=old)
-        self.assertTrue(self.lib().get("很久没命中的经验").is_dead_weight)
+    """健康度分组。**每一组的处置方向不同,分错比不分更坏。**
 
-    def test_fresh_lesson_is_not_dead(self):
+    尤其是 starved_index 和 dead:现象完全一样(注入 0 次),
+    病因和处方却相反 ——
+        死重      进过索引但没人读 → 删掉,或改 trigger
+        索引饿死  连索引都没进过   → 扩容量,**不许删**
+    当成同一类处理,会让用户删掉一批只是没排上队的有用经验。
+    """
+
+    def test_excluded_is_starved_index_not_dead(self):
+        """被索引挤掉过 + 从没进去过 → 索引饿死,不是死重。
+
+        **判据是被挤掉的次数,不是年龄。** 容量溢出是算术事实:
+        50 条经验、上限 40 条,今天就排除了 10 条,跟放了多久无关。
+        拿年龄当判据会让信号晚 30 天出现,而这段时间里
+        用户看到的一切正常 —— 那正是本项目最想消灭的失效模式。
+        """
+        les = self.add("被容量挤掉的", created="2020-01-01")
+        self.lib().bump_all([(les, "excluded", 3)])
+
+        got = self.lib().get("被容量挤掉的")
+        self.assertTrue(got.is_starved_index)
+        self.assertFalse(got.is_dead_weight, "它根本没机会露面,不叫死重")
+        self.assertEqual(got.health(), "starved_index")
+
+    def test_exclusion_reported_immediately_not_after_30_days(self):
+        """**容量问题是当天就报的,不用等 30 天。**
+
+        死重需要时间(这条经验可能只是还没被用上),但索引装不下
+        是结构事实 —— 一条今天刚写、今天就排在 41 位的经验,
+        今天就已经没机会了。
+        """
+        import datetime as dt
+        les = self.add("今天刚写的", created=dt.date.today().isoformat())
+        self.lib().bump_all([(les, "excluded", 1)])
+
+        got = self.lib().get("今天刚写的")
+        self.assertEqual(got.health(), "starved_index",
+                         "新建的经验被挤掉,当场就该报出来")
+
+    def test_indexed_but_never_read_is_dead(self):
+        """进过索引却没被拉过全文 → 这才是死重。"""
+        les = self.add("进过索引没人读", created="2020-01-01")
+        self.lib().bump_all([(les, "indexed", 3)])
+        got = self.lib().get("进过索引没人读")
+        self.assertTrue(got.is_dead_weight)
+        self.assertFalse(got.is_starved_index)
+        self.assertEqual(got.health(), "dead")
+
+    def test_indexed_beats_excluded(self):
+        """进过索引的,就算也被挤掉过,也不算饿死 —— 它有过机会。"""
+        les = self.add("进去过也被挤过", created="2020-01-01")
+        self.lib().bump_all([(les, "indexed", 1), (les, "excluded", 5)])
+        got = self.lib().get("进去过也被挤过")
+        self.assertFalse(got.is_starved_index)
+        self.assertTrue(got.is_dead_weight, "有过机会却没被读 → 死重")
+
+    def test_fresh_lesson_is_neither(self):
         import datetime as dt
         self.add("新经验", created=dt.date.today().isoformat())
-        self.assertFalse(self.lib().get("新经验").is_dead_weight)
+        got = self.lib().get("新经验")
+        self.assertFalse(got.is_dead_weight)
+        self.assertFalse(got.is_starved_index)
 
     def test_injected_lesson_never_dead(self):
-        """被命中过就不算死重,不管多老。"""
+        """被投递过就不算死重,不管多老。"""
         les = self.add("老但被命中过", created="2020-01-01")
-        self.lib().bump_all([(les, "injected", 1)])
-        self.assertFalse(self.lib().get("老但被命中过").is_dead_weight)
+        self.lib().bump_all([(les, "indexed", 5), (les, "injected", 1)])
+        got = self.lib().get("老但被命中过")
+        self.assertFalse(got.is_dead_weight)
+        self.assertFalse(got.is_starved_index)
+
+    def test_session_start_counts_as_indexed_not_injected(self):
+        """索引和正文是两件事,必须分开记 —— 否则死重/饿死分不开。"""
+        les = self.add("只进索引", trigger="当你做某事时")
+        self.start("S1")
+
+        got = self.lib().get("只进索引")
+        self.assertEqual(got.indexed, 1)
+        self.assertEqual(got.excluded, 0)
+        self.assertEqual(got.injected, 0,
+                         "只有标题进了上下文,不能算正文投递过")
+        self.assertEqual(les.id, got.id)
+
+    def test_overflow_is_recorded_as_excluded_at_render_time(self):
+        """**没挤进索引的必须当场记账** —— 这是"被容量挤掉"的唯一确凿证据。
+
+        只记"谁进去了"的话,被挤掉的那些和"从没被渲染过"的
+        在数据上完全一样,于是只能靠年龄猜 —— 而容量问题是
+        算术事实,当天就该报。
+        """
+        n = 130
+        for i in range(n):
+            self.add(f"经验{i:03d}", trigger=f"当你处理第{i}类问题时")
+        self.start("S1")
+
+        items = self.lib().all()
+        shown = [l for l in items if l.indexed > 0]
+        dropped = [l for l in items if l.excluded > 0]
+        self.assertEqual(len(shown) + len(dropped), n, "每条都该被记一笔")
+        self.assertTrue(dropped, "超过容量就该有人被挤掉")
+        self.assertTrue(all(l.health() == "starved_index" for l in dropped))
+        # 它们是**当天**就报出来的,不是等 30 天
+        self.assertTrue(all(l.created for l in dropped))
+
+    def test_starved_ranks_ahead_of_fresh_in_index(self):
+        """**打破饿死的自我锁定。**
+
+        被容量挤掉的经验 indexed 恒为 0,而排序又把它压在最后 ——
+        越饿死越靠后,越靠后越饿死。所以 starved 要提到前面:
+        一条反复撞上却从没送到的经验,比一条刚写完还没人踩过的
+        更该占那 40 个格子之一。
+        """
+        import datetime as dt
+        starved = self.add("饿死过的", trigger="当你做 A 时")
+        fresh = self.add("新写的", trigger="当你做 B 时",
+                         created=dt.date.today().isoformat())
+        self.lib().bump_all([(starved, "starved", exp.STARVE_THRESHOLD)])
+
+        block, ids = exp.render_index(self.lib())
+        self.assertIn(starved.id, ids)
+        self.assertLess(ids.index(starved.id), ids.index(fresh.id),
+                        "饿死过的应该排在前面")
+        self.assertIn("饿死", block)
 
     def test_health_priority(self):
         """rotten 优先于 dead —— 反复复发比从没命中更值得处理。"""
@@ -412,24 +895,51 @@ class TestCache(Base):
 
 # ── 索引容量 ───────────────────────────────────────
 class TestIndexCapacity(Base):
+    def test_fills_by_char_budget_not_item_count(self):
+        """**真正约束成本的是字符预算,不是条数。**
+
+        上一版 INDEX_MAX_ITEMS=40,而 4000 字符预算实测能装约 78 条 ——
+        一半预算白白浪费,10 条经验被无谓地挤掉。
+        现在条数只是防爆上限,装不下就装不下,别提前截断。
+        """
+        for i in range(exp.INDEX_MAX_ITEMS + 5):
+            self.add(f"经验{i:03d}", trigger=f"当你处理第{i}类问题时")
+        _, shown = exp.render_index(self.lib())
+        self.assertGreater(len(shown), exp.INDEX_MAX_ITEMS,
+                           "预算还有富余就不该按条数提前截断")
+        self.assertLess(len(shown), exp.INDEX_MAX_ITEMS + 5)
+
     def test_truncation_reported_not_silent(self):
-        """**截断必须报告。**
+        """**截断必须报告,而且要告诉模型怎么够到剩下的。**
 
         静默截断是最隐蔽的失效:被漏掉的经验永远不会被注入,
         所以它们的 missed 永远算不出来 —— 库里显示"一切正常"。
         """
-        for i in range(exp.INDEX_MAX_ITEMS + 5):
+        n = 200
+        for i in range(n):
             self.add(f"经验{i:03d}", trigger=f"当你处理第{i}类问题时")
-        lib = self.lib()
-        block, shown = exp.render_index(lib)
-        self.assertEqual(len(shown), exp.INDEX_MAX_ITEMS)
-        self.assertIn("未注入", block, "截断必须在索引里明确说明")
+        block, shown = exp.render_index(self.lib())
+        self.assertLess(len(shown), n, "确实发生了截断")
+        self.assertIn(f"库里共 {n} 条", block, "必须说明库比列表大")
 
-    def test_no_warning_when_fits(self):
+    def test_truncation_tells_model_how_to_reach_the_rest(self):
+        """**截断提示要对模型有用,不是给维护者看的。**
+
+        上一版写的是"跑 exp cluster 看哪些该合并" —— 读这段文字的是模型,
+        它既不跑 cluster 也不合并经验,只会把这句当噪声。
+        对模型有用的只有:库比列表大,以及用 exp query 能拿到剩下的。
+        """
+        for i in range(200):
+            self.add(f"经验{i:03d}", trigger=f"当你处理第{i}类问题时")
+        block, _ = exp.render_index(self.lib())
+        self.assertIn("exp query", block,
+                      "要告诉模型怎么够到没列出的经验")
+
+    def test_no_report_when_fits(self):
         self.add("唯一的一条", trigger="当你测试时")
         block, shown = exp.render_index(self.lib())
         self.assertEqual(len(shown), 1)
-        self.assertNotIn("未注入", block)
+        self.assertNotIn("库里共", block)
 
 
 # ── 数据完整性 ─────────────────────────────────────

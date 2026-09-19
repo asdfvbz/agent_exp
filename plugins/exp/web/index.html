@@ -25,6 +25,9 @@
   --warning:  #fab219;
   --serious:  #ec835a;
   --critical: #d03b3b;
+  /* 饿死类专用:它们**不是**"坏经验",所以刻意不用红/黄色系 ——
+     用红黄会让人以为要改经验,而这两类的处方恰恰是别动经验。 */
+  --info:     #4a7fb5;
 
   --r: 8px;
   --sans: system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
@@ -94,6 +97,7 @@ h1 .sub { font-weight: 400; color: var(--muted); font-size: 13px; margin-left: 1
 .g-warning  { color: var(--warning); }
 .g-serious  { color: var(--serious); }
 .g-critical { color: var(--critical); }
+.g-info     { color: var(--info); }
 .g-muted    { color: var(--muted); }
 
 /* 形状区分:不同健康度用不同字形,色盲/灰度下仍可辨 */
@@ -246,7 +250,7 @@ tbody tr:hover { background: var(--wash); }
   <div class="toolbar">
     <input type="search" id="q" placeholder="搜索标题 / 触发词 / 根因 / 做法…" autocomplete="off">
     <select id="f-layer"><option value="">全部层级</option><option value="project">项目级</option><option value="global">全局级</option></select>
-    <select id="f-health"><option value="">全部健康度</option><option value="ok">正常</option><option value="missed">检索漏检</option><option value="dead">死重</option><option value="rotten">反复复发</option></select>
+    <select id="f-health"><option value="">全部健康度</option><option value="ok">正常</option><option value="missed">检索漏检</option><option value="starved">投递饿死</option><option value="starved_index">索引饿死</option><option value="dead">死重</option><option value="rotten">反复复发</option></select>
     <select id="f-cat"><option value="">全部分类</option></select>
     <select id="f-status"><option value="">全部状态</option><option value="confirmed">已确认</option><option value="hypothesis">未验证</option><option value="refuted">已推翻</option><option value="needs_rewrite">待重写</option></select>
     <span class="spacer"></span>
@@ -284,18 +288,25 @@ let kpiFilter = "";
    文案在 Python 里单点定义,CLI 和网页共用 —— 两边各写一份必然漂移,
    而对"哪些经验是坏的"给出不同答案是致命的。 */
 const HEALTH_TONE = {
-  ok:      { glyph:"●", tone:"g-good" },
-  missed:  { glyph:"▲", tone:"g-warning" },
-  dead:    { glyph:"◆", tone:"g-serious" },
-  rotten:  { glyph:"■", tone:"g-critical" },
+  ok:            { glyph:"●", tone:"g-good" },
+  missed:        { glyph:"▲", tone:"g-warning" },
+  dead:          { glyph:"◆", tone:"g-serious" },
+  rotten:        { glyph:"■", tone:"g-critical" },
+  starved:       { glyph:"◇", tone:"g-info" },
+  starved_index: { glyph:"○", tone:"g-info" },
 };
-const HEALTH_ORDER = ["rotten", "missed", "dead", "ok"];
-/* 分组视图的标题 —— 和 exp list 的分组一致 */
+/* 字形刻意不复用:● ▲ ◆ ■ ○ ◇ 在灰度打印和色盲下都能区分开。 */
+const HEALTH_ORDER = ["rotten", "starved", "starved_index", "missed", "dead", "ok"];
+/* 分组视图的标题 —— 和 exp list 的分组一致。
+   后两组刻意写明"不是经验的错":它们的现象和 dead 一样(注入 0 次),
+   但处方相反 —— 当成死重去删,会删掉一批只是没排上队的有用经验。 */
 const HEALTH_HEAD = {
-  rotten: "反复复发 —— 注入了还是犯,fix 不可执行",
-  missed: "检索漏检 —— 触发词写偏了,该命中没命中",
-  dead:   "死重 —— 记了 30 天从没被命中过",
-  ok:     "正常",
+  rotten:        "反复复发 —— 注入了还是犯,fix 不可执行",
+  missed:        "检索漏检 —— 触发词写偏了,该命中没命中",
+  starved:       "投递饿死 —— 签名命中了却没送到,不是 trigger 的问题",
+  starved_index: "索引饿死 —— 索引装不下,它从没露过面(别删)",
+  dead:          "死重 —— 进过索引却从没被拉过全文",
+  ok:            "正常",
 };
 const STATUS = {
   confirmed:     { label:"已确认", tone:"g-good" },
@@ -320,6 +331,8 @@ function renderKpis() {
     { k:"总数",     v:s.total,      f:"",          tone:"g-muted",    glyph:"●" },
     { k:"已确认",   v:s.confirmed,  f:"status=confirmed",                 tone:"g-good",     glyph:"●" },
     { k:"反复复发", v:s.rotten,     f:"health=rotten",                    tone:"g-critical", glyph:"■" },
+    { k:"投递饿死", v:s.starved,    f:"health=starved",                   tone:"g-info",     glyph:"◇" },
+    { k:"索引饿死", v:s.starved_index, f:"health=starved_index",          tone:"g-info",     glyph:"○" },
     { k:"死重",     v:s.dead,       f:"health=dead",                      tone:"g-serious",  glyph:"◆" },
     { k:"检索漏检", v:s.missed,     f:"health=missed",                    tone:"g-warning",  glyph:"▲" },
   ];
@@ -373,7 +386,8 @@ function filtered() {
   });
 }
 
-const HEALTH_TINT = { rotten:"critical", missed:"warning", dead:"serious", ok:"" };
+const HEALTH_TINT = { rotten:"critical", missed:"warning", dead:"serious",
+                      starved:"info", starved_index:"info", ok:"" };
 function healthBadge(l) {
   const h = typeof l === "string" ? l : l.health;
   const k = HEALTH_TONE[h] || HEALTH_TONE.ok;
@@ -443,9 +457,11 @@ function cardHtml(l) {
       </div>
       ${l.trigger ? `<div class="trigger">${esc(l.trigger)}</div>` : ""}
       <div class="meta">
+        <span>索引 <b>${l.indexed}</b></span>
         <span>注入 <b>${l.injected}</b></span>
         <span>复发 <b>${l.recurred}</b></span>
         <span>漏检 <b>${l.missed}</b></span>
+        <span>饿死 <b>${l.starved}</b></span>
         <span>有用 <b>${l.helped}</b></span>
         <span>${esc(l.category)}</span>
       </div>

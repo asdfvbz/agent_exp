@@ -8,3 +8,7 @@ venv/
 
 # 本地测试时可能留下的经验库
 .exp/
+
+# 本仓库自己的 Claude Code 配置 —— 含本地探针脚本(spike_hook.py)。
+# 不是仓库内容,不进版本库。
+.claude/

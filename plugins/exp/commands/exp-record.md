@@ -36,13 +36,22 @@ python "${CLAUDE_PLUGIN_ROOT}/exp.py" query "<关键词>"
 
 ```bash
 python "${CLAUDE_PLUGIN_ROOT}/exp.py" add "<标题>" \
-    --category 基架|度量|流程|写作|市场 \
+    --category 基架|度量|流程|其他 \
     --trigger "当你正在做 X 时" \
     --symptom "<表现>" \
     --root-cause "<根因>" \
     --fix "<可执行的做法>" \
     --evidence "<实测数据优先于推理>" \
     --severity high|medium|low
+```
+
+**如果这个坑有对应的工具报错,顺手挂上签名 —— 价值很大。**
+挂了签名的经验,失败时会**自动**把做法送到模型眼前(不用它主动查),
+而且能被自动判定"看过做法还是犯"。签名从 `exp distill` 的输出里抄:
+
+```bash
+python "${CLAUDE_PLUGIN_ROOT}/exp.py" distill
+python "${CLAUDE_PLUGIN_ROOT}/exp.py" add "<标题>" ... --signature "Bash|1|<归一化后的错误>"
 ```
 
 范围判断:
